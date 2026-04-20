@@ -25,10 +25,10 @@ const uint8_t CADU_ASM_4 = 0x1D;
 // PIO program for BPSK modulator
 // Pull one word per byte period, then shift 8 bits to the output pin.
 static const uint16_t bpsk_modulator_program[] = {
-    pio_encode_pull(false, false), // 0: pull noblock
-    pio_encode_set(pio_x, 7),      // 1: set x, 7
-    pio_encode_out(pio_pins, 1),   // 2: out pins, 1
-    pio_encode_jmp_x_dec(2),       // 3: jmp x--, 2
+    0x8080, // 0: pull noblock
+    0xe027, // 1: set x, 7
+    0x6001, // 2: out pins, 1
+    0x0042, // 3: jmp x--, 2
 };
 
 static const pio_program_t bpsk_modulator_program_default = {
@@ -50,6 +50,7 @@ private:
     bool msg_pending;
     bool running;
     bool restore_filler_after_message;
+    bool invert_output;
 
 public:
     uint8_t frame[FRAME_SIZE];
@@ -271,6 +272,14 @@ public:
         stop();
         gpio_set_function(pin, GPIO_FUNC_SIO);
         gpio_set_dir(pin, GPIO_OUT);
+    }
+
+    void set_invert_output(bool invert) {
+        invert_output = invert;
+    }
+
+    bool get_invert_output() const {
+        return invert_output;
     }
 };
 

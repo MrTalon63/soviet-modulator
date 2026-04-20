@@ -54,12 +54,12 @@ void init_si5351_lo() {
 	}
 
 	si5351.set_clock_pwr(SI5351_CLK0, 1);
-	si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_4MA);
+	si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_2MA);
 	si5351.set_freq(LO_FREQUENCY_01HZ, SI5351_CLK0);
 	si5351.output_enable(SI5351_CLK0, 1);
 	Serial.print("Si5351 LO set to ");
 	Serial.print(LO_FREQUENCY_HZ / 1000000ULL);
-	Serial.println(" MHz on CLK0 at 4 mA drive");
+	Serial.println(" MHz on CLK0 at 2 mA drive");
 }
 
 [[noreturn]] void reboot_microcontroller() {
