@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <hardware/pio.h>
+#include <hardware/pio_instructions.h>
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
 
@@ -12,16 +13,17 @@
 #define MSG_BUFFER_SIZE 512
 
 // PIO program for BPSK modulator
-// Simple program: shift out 8 bits to pin; OSR is refilled via autopull.
+// Pull one word per byte period, then shift 8 bits to the output pin.
 static const uint16_t bpsk_modulator_program[] = {
-    0xe027,  // 0: set x, 7
-    0xb040,  // 1: out pins, 1
-    0x0081,  // 2: jmp x--, 1
+    pio_encode_pull(false, false), // 0: pull noblock
+    pio_encode_set(pio_x, 7),      // 1: set x, 7
+    pio_encode_out(pio_pins, 1),   // 2: out pins, 1
+    pio_encode_jmp_x_dec(2),       // 3: jmp x--, 2
 };
 
 static const pio_program_t bpsk_modulator_program_default = {
     .instructions = bpsk_modulator_program,
-    .length = 3,
+    .length = 4,
     .origin = -1,
 };
 
@@ -108,8 +110,8 @@ public:
         // Limit execution to this instruction sequence.
         sm_config_set_wrap(&c, pio_offset, pio_offset + bpsk_modulator_program_default.length - 1);
         
-        // Right shift, autopull after 8 bits
-        sm_config_set_out_shift(&c, true, true, 8);
+        // Right shift; pulls are handled explicitly in the PIO program.
+        sm_config_set_out_shift(&c, true, false, 32);
 
         // Hand GPIO over to selected PIO instance.
         pio_gpio_init(pio, pin);
@@ -191,10 +193,18 @@ public:
     void set_symbolrate(uint32_t hz) {
         if (hz < 1 || hz > 100000) return;
 
-        symbolrate_hz = hz;
-
         // Use runtime sys clock (125 MHz on RP2040, 150 MHz on RP2350 by default).
-        float clkdiv = (float)clock_get_hz(clk_sys) / (hz * 2.0f);
+        float clkdiv = (float)clock_get_hz(clk_sys) / (hz * 1.0f);
+
+        // RP2 PIO divider integer part is 16-bit (plus 8-bit fractional), so clamp.
+        if (clkdiv < 1.0f) {
+            clkdiv = 1.0f;
+        } else if (clkdiv > 65535.996f) {
+            clkdiv = 65535.996f;
+        }
+
+        // Keep the reported symbol rate aligned with the actual programmed divider.
+        symbolrate_hz = (uint32_t)((float)clock_get_hz(clk_sys) / (clkdiv * 1.0f));
 
         pio_sm_set_clkdiv(pio, sm, clkdiv);
     }

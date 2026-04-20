@@ -1,11 +1,20 @@
 #include <Arduino.h>
 #include "bpsk_modulator.h"
+#include <Wire.h>
+#include <si5351.h>
+#include <hardware/watchdog.h>
 
 #define MODULATING_PIN 20
 #define LED_PIN 25
 #define INPUT_BUFFER_SIZE 512
+#define SI5351_SDA_PIN 16
+#define SI5351_SCL_PIN 17
 
-BPSKModulator modulator(MODULATING_PIN, 1000);
+static constexpr uint64_t LO_FREQUENCY_HZ = 51000000ULL;
+static constexpr uint64_t LO_FREQUENCY_01HZ = LO_FREQUENCY_HZ * SI5351_FREQ_MULT;
+
+static BPSKModulator* modulator = nullptr;
+static Si5351 si5351;
 static bool filler_enabled = true;
 static unsigned long frame_start = 0;
 static const unsigned long FRAME_PERIOD_MS = 100;
@@ -23,6 +32,45 @@ static bool test_mode = false;
 static unsigned long last_pulse = 0;
 static bool pulse_state = false;
 
+void init_si5351_i2c() {
+	Wire.setSDA(SI5351_SDA_PIN);
+	Wire.setSCL(SI5351_SCL_PIN);
+	Wire.begin();
+	Serial.print("Si5351 I2C on SDA GP");
+	Serial.print(SI5351_SDA_PIN);
+	Serial.print(", SCL GP");
+	Serial.println(SI5351_SCL_PIN);
+}
+
+void init_si5351_lo() {
+	if (!si5351.init(SI5351_CRYSTAL_LOAD_8PF, 0, 0)) {
+		Serial.println("Si5351 init failed");
+		return;
+	}
+
+	for (uint8_t clk = SI5351_CLK1; clk <= SI5351_CLK7; clk++) {
+		si5351.set_clock_pwr((enum si5351_clock)clk, 0);
+		si5351.output_enable((enum si5351_clock)clk, 0);
+	}
+
+	si5351.set_clock_pwr(SI5351_CLK0, 1);
+	si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_4MA);
+	si5351.set_freq(LO_FREQUENCY_01HZ, SI5351_CLK0);
+	si5351.output_enable(SI5351_CLK0, 1);
+	Serial.print("Si5351 LO set to ");
+	Serial.print(LO_FREQUENCY_HZ / 1000000ULL);
+	Serial.println(" MHz on CLK0 at 4 mA drive");
+}
+
+[[noreturn]] void reboot_microcontroller() {
+	Serial.println("Rebooting microcontroller");
+	Serial.flush();
+	delay(50);
+	watchdog_reboot(0, 0, 0);
+	while (true) {
+	}
+}
+
 void setup() {
 	pinMode(LED_PIN, OUTPUT);
 	digitalWrite(LED_PIN, LOW);
@@ -30,7 +78,14 @@ void setup() {
 	digitalWrite(23, HIGH); // Set pin 23 high so DC/DC isn't fucking shitfest
 	
 	Serial.begin(115200);
-	delay(1000);
+	delay(5000);
+	modulator = new BPSKModulator(MODULATING_PIN, 1200);
+	if (modulator == nullptr) {
+		Serial.println("Modulator allocation failed");
+		return;
+	}
+	init_si5351_i2c();
+	init_si5351_lo();
 	
 	Serial.println("BPSK Modulator initialized");
 	Serial.print("Modulation GPIO: ");
@@ -43,6 +98,8 @@ void setup() {
 	Serial.println("  f - Toggle filler transmission");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
 	Serial.println("  d - Toggle debug pulse (software 100ms toggle on pin 20)");
+	Serial.println("  x - Reinitialize Si5351 LO to 51 MHz");
+	Serial.println("  m - Restart whole microcontroller");
 	
 	frame_start = millis();
 }
@@ -52,7 +109,7 @@ void process_input(char mode, const char* data) {
 
   	if (mode == 'r') {
 		uint32_t rate = atol(data);
-		modulator.set_symbolrate(rate);
+		if (modulator != nullptr) modulator->set_symbolrate(rate);
 		Serial.print("Symbol rate set to: ");
 		Serial.println(rate);
   	} else if (mode == 't') {
@@ -64,7 +121,7 @@ void process_input(char mode, const char* data) {
 	  		for (uint16_t i = 0; i < len; i++) {
 				msg[i] = (uint8_t)data[i];
 	  		}
-	  		modulator.queue_message(msg, len);
+	  		if (modulator != nullptr) modulator->queue_message(msg, len);
 	  		Serial.print("Message queued: ");
 	  		Serial.print(len);
 	  		Serial.println(" bytes");
@@ -73,6 +130,10 @@ void process_input(char mode, const char* data) {
 }
 
 void loop() {
+	if (modulator == nullptr) {
+		return;
+	}
+
   	// LED heartbeat: toggle every 500ms for 1s total blink cycle
   	unsigned long now = millis();
   	if (now - last_blink >= 500) {
@@ -90,14 +151,14 @@ void loop() {
   		}
   	}
 
-  	if (modulator.has_pending_message()) {
+	if (modulator->has_pending_message()) {
 		if (now - frame_start >= FRAME_PERIOD_MS) {
-	  	modulator.inject_message(filler_enabled);
+	  	modulator->inject_message(filler_enabled);
 	  	frame_start = now;
 		}
   	}
 
-	modulator.service();
+	modulator->service();
 
   	if (Serial.available()) {
 		char c = Serial.read();
@@ -122,34 +183,34 @@ void loop() {
 		  			break;
 				}
 				case 's': {
-				  	modulator.start();
+				  	modulator->start();
 				  	Serial.println("Modulation started");
 				  	Serial.print("SM: ");
-				  	Serial.println(modulator.get_sm());
+				  	Serial.println(modulator->get_sm());
 				  	Serial.print("FIFO state - empty: ");
-				  	Serial.print(modulator.tx_fifo_empty());
+				  	Serial.print(modulator->tx_fifo_empty());
 				  	Serial.print(", full: ");
-				  	Serial.println(modulator.tx_fifo_full());
+				  	Serial.println(modulator->tx_fifo_full());
 				  	break;
 				}
 			case 'p': {
-			  modulator.stop();
+				  modulator->stop();
 			  Serial.println("Modulation stopped");
 			  break;
 			}
 			case 'i': {
 			 	 Serial.print("Current symbol rate: ");
-			 	 Serial.print(modulator.get_symbolrate());
+				 	 Serial.print(modulator->get_symbolrate());
 			 	 Serial.println(" Hz");
 			 	 break;
 			}
 			case 'f': {
 				filler_enabled = !filler_enabled;
 				if (filler_enabled) {
-					modulator.init_frame();
+						modulator->init_frame();
 					Serial.println("Filler transmission enabled");
 				} else {
-					memset(modulator.frame, 0, FRAME_SIZE);
+						memset(modulator->frame, 0, FRAME_SIZE);
 					Serial.println("Filler transmission disabled");
 				}
 			  	break;
@@ -164,7 +225,7 @@ void loop() {
 			case 'd': {
 				test_mode = !test_mode;
 				if (test_mode) {
-					modulator.release_pin_to_sio();
+					modulator->release_pin_to_sio();
 					Serial.println("Debug pulse ON - SIO pin toggle every 100ms");
 					pulse_state = false;
 					digitalWrite(MODULATING_PIN, LOW);
@@ -172,8 +233,17 @@ void loop() {
 				} else {
 					Serial.println("Debug pulse OFF");
 					digitalWrite(MODULATING_PIN, LOW);
-					modulator.start();
+					modulator->start();
 				}
+				break;
+			}
+			case 'x': {
+				Serial.println("Reinitializing Si5351 LO");
+				init_si5351_lo();
+				break;
+			}
+			case 'm': {
+				reboot_microcontroller();
 				break;
 			}
 			default:
