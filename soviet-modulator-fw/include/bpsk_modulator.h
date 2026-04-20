@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 #include <hardware/pio.h>
+#include <hardware/clocks.h>
+#include <hardware/gpio.h>
 
 #define FRAME_SIZE 1024
 #define CCSDS_ASM_SIZE 4
@@ -10,17 +12,16 @@
 #define MSG_BUFFER_SIZE 512
 
 // PIO program for BPSK modulator
-// Simple program: pull byte, shift out 8 bits to pin
+// Simple program: shift out 8 bits to pin; OSR is refilled via autopull.
 static const uint16_t bpsk_modulator_program[] = {
-    0x80a0,  // 0: pull   noblock
-    0xa022,  // 1: mov    x, ~null     (load bit counter: 31 -> will loop 8 times for 8-bit shift)
-    0xb040,  // 2: out    pins, 1      (shift out 1 bit to pin)
-    0x0082,  // 3: jmp    x-- 2        (loop until done)
+    0xe027,  // 0: set x, 7
+    0xb040,  // 1: out pins, 1
+    0x0081,  // 2: jmp x--, 1
 };
 
 static const pio_program_t bpsk_modulator_program_default = {
     .instructions = bpsk_modulator_program,
-    .length = 4,
+    .length = 3,
     .origin = -1,
 };
 
@@ -28,16 +29,20 @@ class BPSKModulator {
 private:
     PIO pio;
     uint sm;
+    uint pin;
     uint32_t symbolrate_hz;
     uint pio_offset;
+    uint16_t tx_index;
     uint16_t msg_len;
     bool msg_pending;
+    bool running;
+    bool restore_filler_after_message;
 
 public:
     uint8_t frame[FRAME_SIZE];
     uint8_t msg_buffer[MSG_BUFFER_SIZE];
     BPSKModulator(uint pin, uint32_t initial_symbolrate = 1000) 
-        : pio(pio0), sm(0), symbolrate_hz(initial_symbolrate), msg_len(0), msg_pending(false) {
+        : pio(pio0), sm(0), pin(pin), symbolrate_hz(initial_symbolrate), pio_offset(0), tx_index(0), msg_len(0), msg_pending(false), running(false), restore_filler_after_message(false) {
         init_frame();
         init_pio(pin);
     }
@@ -91,34 +96,50 @@ public:
         // Load PIO program
         pio_offset = pio_add_program(pio, &bpsk_modulator_program_default);
 
+        // Claim an unused SM so this works even when SM0 is already taken.
+        sm = pio_claim_unused_sm(pio, true);
+
         // Initialize state machine config
         pio_sm_config c = pio_get_default_sm_config();
         
         // Set output pin (shift out to this pin)
         sm_config_set_out_pins(&c, pin, 1);
+
+        // Limit execution to this instruction sequence.
+        sm_config_set_wrap(&c, pio_offset, pio_offset + bpsk_modulator_program_default.length - 1);
         
         // Right shift, autopull after 8 bits
         sm_config_set_out_shift(&c, true, true, 8);
 
+        // Hand GPIO over to selected PIO instance.
+        pio_gpio_init(pio, pin);
+
         // Initialize and start SM
+        pio_sm_clear_fifos(pio, sm);
+        pio_sm_restart(pio, sm);
         pio_sm_init(pio, sm, pio_offset, &c);
         pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
         
         set_symbolrate(symbolrate_hz);
         pio_sm_set_enabled(pio, sm, true);
+        running = true;
 
         // Fill TX FIFO with initial data
         refill_fifo();
     }
 
     void refill_fifo() {
-        // Non-blocking: push bytes only if FIFO has space
-        // Don't wait for all bytes to be written
-        for (uint16_t i = 0; i < FRAME_SIZE; i++) {
-            if (!pio_sm_is_tx_fifo_full(pio, sm)) {
-                pio_sm_put(pio, sm, frame[i]);
-            } else {
-                break;  // FIFO full, try again later
+        // Keep FIFO topped up and preserve position in the frame.
+        while (!pio_sm_is_tx_fifo_full(pio, sm)) {
+            pio_sm_put(pio, sm, frame[tx_index]);
+            tx_index++;
+            if (tx_index >= FRAME_SIZE) {
+                tx_index = 0;
+                if (restore_filler_after_message) {
+                    // Message frame has been fully queued once; resume default filler frame.
+                    init_frame();
+                    restore_filler_after_message = false;
+                }
             }
         }
     }
@@ -134,16 +155,36 @@ public:
         return msg_pending;
     }
 
+    bool tx_fifo_empty() const {
+        return pio_sm_is_tx_fifo_empty(pio, sm);
+    }
+
+    bool tx_fifo_full() const {
+        return pio_sm_is_tx_fifo_full(pio, sm);
+    }
+
+    uint get_sm() const {
+        return sm;
+    }
+
     void inject_message(bool filler_enabled) {
         if (!msg_pending || msg_len == 0) return;
 
         if (filler_enabled) {
             init_frame_with_message(msg_buffer, msg_len);
+            restore_filler_after_message = true;
         } else {
             init_frame_message_only(msg_buffer, msg_len);
+            restore_filler_after_message = false;
         }
 
         msg_pending = false;
+        tx_index = 0;
+        refill_fifo();
+    }
+
+    void service() {
+        if (!running) return;
         refill_fifo();
     }
 
@@ -152,9 +193,8 @@ public:
 
         symbolrate_hz = hz;
 
-        // clkdiv = sys_clock / (symbolrate * 2)
-        // sys_clock = 150 MHz for RP2350
-        float clkdiv = 150000000.0f / (hz * 2.0f);
+        // Use runtime sys clock (125 MHz on RP2040, 150 MHz on RP2350 by default).
+        float clkdiv = (float)clock_get_hz(clk_sys) / (hz * 2.0f);
 
         pio_sm_set_clkdiv(pio, sm, clkdiv);
     }
@@ -164,12 +204,23 @@ public:
     }
 
     void start() {
+        // Reclaim pin for PIO in case it was temporarily switched to SIO for debug.
+        pio_gpio_init(pio, pin);
+        pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
         pio_sm_set_enabled(pio, sm, true);
+        running = true;
         refill_fifo();
     }
 
     void stop() {
         pio_sm_set_enabled(pio, sm, false);
+        running = false;
+    }
+
+    void release_pin_to_sio() {
+        stop();
+        gpio_set_function(pin, GPIO_FUNC_SIO);
+        gpio_set_dir(pin, GPIO_OUT);
     }
 };
 

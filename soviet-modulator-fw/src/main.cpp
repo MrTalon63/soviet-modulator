@@ -18,14 +18,23 @@ static uint16_t input_idx = 0;
 static bool waiting_for_input = false;
 static char input_mode = '\0';
 
+// Test mode
+static bool test_mode = false;
+static unsigned long last_pulse = 0;
+static bool pulse_state = false;
+
 void setup() {
 	pinMode(LED_PIN, OUTPUT);
 	digitalWrite(LED_PIN, LOW);
+	pinMode(23, OUTPUT);
+	digitalWrite(23, HIGH); // Set pin 23 high so DC/DC isn't fucking shitfest
 	
 	Serial.begin(115200);
 	delay(1000);
 	
 	Serial.println("BPSK Modulator initialized");
+	Serial.print("Modulation GPIO: ");
+	Serial.println(MODULATING_PIN);
 	Serial.println("Commands:");
 	Serial.println("  r <rate> - Set symbol rate (1-100000 Hz)");
 	Serial.println("  s - Start modulation");
@@ -33,6 +42,7 @@ void setup() {
 	Serial.println("  i - Print current rate");
 	Serial.println("  f - Toggle filler transmission");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
+	Serial.println("  d - Toggle debug pulse (software 100ms toggle on pin 20)");
 	
 	frame_start = millis();
 }
@@ -71,12 +81,23 @@ void loop() {
 		last_blink = now;
   	}
 
+  	// Debug pulse on pin 20 (100ms toggle)
+  	if (test_mode) {
+		if (now - last_pulse >= 100) {
+  			pulse_state = !pulse_state;
+  			digitalWrite(MODULATING_PIN, pulse_state ? HIGH : LOW);
+  			last_pulse = now;
+  		}
+  	}
+
   	if (modulator.has_pending_message()) {
 		if (now - frame_start >= FRAME_PERIOD_MS) {
 	  	modulator.inject_message(filler_enabled);
 	  	frame_start = now;
 		}
   	}
+
+	modulator.service();
 
   	if (Serial.available()) {
 		char c = Serial.read();
@@ -103,6 +124,12 @@ void loop() {
 				case 's': {
 				  	modulator.start();
 				  	Serial.println("Modulation started");
+				  	Serial.print("SM: ");
+				  	Serial.println(modulator.get_sm());
+				  	Serial.print("FIFO state - empty: ");
+				  	Serial.print(modulator.tx_fifo_empty());
+				  	Serial.print(", full: ");
+				  	Serial.println(modulator.tx_fifo_full());
 				  	break;
 				}
 			case 'p': {
@@ -133,6 +160,21 @@ void loop() {
 			  	input_mode = 't';
 			  	input_idx = 0;
 			  	break;
+			}
+			case 'd': {
+				test_mode = !test_mode;
+				if (test_mode) {
+					modulator.release_pin_to_sio();
+					Serial.println("Debug pulse ON - SIO pin toggle every 100ms");
+					pulse_state = false;
+					digitalWrite(MODULATING_PIN, LOW);
+					last_pulse = millis();
+				} else {
+					Serial.println("Debug pulse OFF");
+					digitalWrite(MODULATING_PIN, LOW);
+					modulator.start();
+				}
+				break;
 			}
 			default:
 			  Serial.println("Unknown command");

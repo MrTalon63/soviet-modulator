@@ -7,11 +7,11 @@
 .define public MODULATOR_PIN 0
 
 .wrap_target
-    pull noblock side 0     ; Pull next byte, output 0 while fetching
-    mov x, ~null            ; Set bit counter to 31 (for 8 bits of the byte)
+    pull noblock            ; Pull next byte
+    set x, 7                ; 8 output bits per pulled byte
 bit_loop:
-    out pins, 1 side 0      ; Shift out one bit to pin, side-set holds pin low during setup
-    jmp x-- bit_loop        ; Repeat for all 8 bits (using full 32-bit shift, upper bits ignored)
+    out pins, 1             ; Shift out one bit to pin
+    jmp x-- bit_loop        ; Repeat for all 8 bits
 .wrap
 
 ; Clock configuration:
