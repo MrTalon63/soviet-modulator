@@ -2,19 +2,13 @@
 ; BPSK Modulator - outputs one bit per symbol period
 ; 
 ; Bit order: MSB first from each byte
-; State machine pulls bytes from TX FIFO and outputs each bit to GPIO
-
-.define public MODULATOR_PIN 0
+; Autopull feeds a new byte every 8 shifted bits
 
 .wrap_target
-    pull noblock            ; Pull next byte
-    set x, 7                ; 8 output bits per pulled byte
-bit_loop:
-    out pins, 1             ; Shift out one bit to pin
-    jmp x-- bit_loop        ; Repeat for all 8 bits
+    out pins, 1             ; Emit one bit per symbol period
 .wrap
 
 ; Clock configuration:
-; Symbol rate = sys_clock / (clkdiv * 2)
-; For sys_clock = 125 MHz and symbolrate_hz:
-; clkdiv = 125_000_000 / (symbolrate_hz * 2)
+; Symbol rate = sys_clock / clkdiv
+; For sys_clock = 150 MHz and symbolrate_hz:
+; clkdiv = 150_000_000 / symbolrate_hz

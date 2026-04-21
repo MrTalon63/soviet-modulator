@@ -27,10 +27,20 @@ static uint16_t input_idx = 0;
 static bool waiting_for_input = false;
 static char input_mode = '\0';
 
-// Test mode
-static bool test_mode = false;
-static unsigned long last_pulse = 0;
-static bool pulse_state = false;
+/*
+Command summary:
+  r <rate> - Set symbol rate (1-100000 Hz)
+  s - Start modulation
+  p - Stop modulation
+  i - Print current rate
+  v - Toggle output inversion
+  f - Toggle filler transmission
+  c - Toggle CCSDS convolutional encoding
+	n - Toggle CCSDS randomizer
+  t <data> - Transmit message (ASCII text)
+  x - Reinitialize Si5351 LO to 51 MHz
+  m - Restart whole microcontroller
+*/
 
 void init_si5351_i2c() {
 	Wire.setSDA(SI5351_SDA_PIN);
@@ -77,7 +87,7 @@ void setup() {
 	pinMode(23, OUTPUT);
 	digitalWrite(23, HIGH); // Set pin 23 high so DC/DC isn't fucking shitfest
 	
-	Serial.begin(115200);
+	Serial.begin(921600);
 	delay(5000);
 	modulator = new BPSKModulator(MODULATING_PIN, 1200);
 	if (modulator == nullptr) {
@@ -88,6 +98,11 @@ void setup() {
 	init_si5351_lo();
 	
 	Serial.println("BPSK Modulator initialized");
+#if USE_PIO_MODULATION
+	Serial.println("  Mode: PIO-based (hardware)");
+#else
+	Serial.println("  Mode: Software Timer-based");
+#endif
 	Serial.print("Modulation GPIO: ");
 	Serial.println(MODULATING_PIN);
 	Serial.println("Commands:");
@@ -95,9 +110,11 @@ void setup() {
 	Serial.println("  s - Start modulation");
 	Serial.println("  p - Stop modulation");
 	Serial.println("  i - Print current rate");
+	Serial.println("  v - Toggle output inversion");
 	Serial.println("  f - Toggle filler transmission");
+	Serial.println("  c - Toggle CCSDS convolutional encoding");
+	Serial.println("  n - Toggle CCSDS randomizer");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
-	Serial.println("  d - Toggle debug pulse (software 100ms toggle on pin 20)");
 	Serial.println("  x - Reinitialize Si5351 LO to 51 MHz");
 	Serial.println("  m - Restart whole microcontroller");
 	
@@ -134,122 +151,130 @@ void loop() {
 		return;
 	}
 
-  	// LED heartbeat: toggle every 500ms for 1s total blink cycle
-  	unsigned long now = millis();
-  	if (now - last_blink >= 500) {
+	// LED heartbeat: toggle every 500ms for 1s total blink cycle
+	unsigned long now = millis();
+	if (now - last_blink >= 500) {
 		led_state = !led_state;
 		digitalWrite(LED_PIN, led_state ? HIGH : LOW);
 		last_blink = now;
-  	}
+	}
 
-  	// Debug pulse on pin 20 (100ms toggle)
-  	if (test_mode) {
-		if (now - last_pulse >= 100) {
-  			pulse_state = !pulse_state;
-  			digitalWrite(MODULATING_PIN, pulse_state ? HIGH : LOW);
-  			last_pulse = now;
-  		}
-  	}
-
+	// Inject pending messages at frame rate
 	if (modulator->has_pending_message()) {
 		if (now - frame_start >= FRAME_PERIOD_MS) {
-	  	modulator->inject_message(filler_enabled);
-	  	frame_start = now;
+			modulator->inject_message(filler_enabled);
+			frame_start = now;
 		}
-  	}
+	}
 
+#if USE_PIO_MODULATION
+	// Service PIO FIFO (PIO mode only)
 	modulator->service();
+#endif
 
-  	if (Serial.available()) {
+	if (Serial.available()) {
 		char c = Serial.read();
 	
 		if (waiting_for_input) {
-	  		if (c == '\n' || c == '\r') {
+			if (c == '\n' || c == '\r') {
 				input_buffer[input_idx] = '\0';
 				process_input(input_mode, input_buffer);
 				waiting_for_input = false;
 				input_idx = 0;
-	  		} else if (input_idx < INPUT_BUFFER_SIZE - 1) {
+			} else if (input_idx < INPUT_BUFFER_SIZE - 1) {
 				input_buffer[input_idx++] = c;
 				Serial.write(c);  // Echo back
-	  		}
+			}
 		} else {
-	  		switch (c) {
+			switch (c) {
 				case 'r': {
-		  			Serial.println("Enter rate (1-100000):");
-		  			waiting_for_input = true;
-		  			input_mode = 'r';
-		  			input_idx = 0;
-		  			break;
+					Serial.println("Enter rate (1-100000):");
+					waiting_for_input = true;
+					input_mode = 'r';
+					input_idx = 0;
+					break;
 				}
 				case 's': {
-				  	modulator->start();
-				  	Serial.println("Modulation started");
-				  	Serial.print("SM: ");
-				  	Serial.println(modulator->get_sm());
-				  	Serial.print("FIFO state - empty: ");
-				  	Serial.print(modulator->tx_fifo_empty());
-				  	Serial.print(", full: ");
-				  	Serial.println(modulator->tx_fifo_full());
-				  	break;
-				}
-			case 'p': {
-				  modulator->stop();
-			  Serial.println("Modulation stopped");
-			  break;
-			}
-			case 'i': {
-			 	 Serial.print("Current symbol rate: ");
-				 	 Serial.print(modulator->get_symbolrate());
-			 	 Serial.println(" Hz");
-			 	 break;
-			}
-			case 'f': {
-				filler_enabled = !filler_enabled;
-				if (filler_enabled) {
-						modulator->init_frame();
-					Serial.println("Filler transmission enabled");
-				} else {
-						memset(modulator->frame, 0, FRAME_SIZE);
-					Serial.println("Filler transmission disabled");
-				}
-			  	break;
-			}
-			case 't': {
-			  	Serial.println("Enter message:");
-			  	waiting_for_input = true;
-			  	input_mode = 't';
-			  	input_idx = 0;
-			  	break;
-			}
-			case 'd': {
-				test_mode = !test_mode;
-				if (test_mode) {
-					modulator->release_pin_to_sio();
-					Serial.println("Debug pulse ON - SIO pin toggle every 100ms");
-					pulse_state = false;
-					digitalWrite(MODULATING_PIN, LOW);
-					last_pulse = millis();
-				} else {
-					Serial.println("Debug pulse OFF");
-					digitalWrite(MODULATING_PIN, LOW);
 					modulator->start();
+					Serial.println("Modulation started");
+#if USE_PIO_MODULATION
+					Serial.print("SM: ");
+					Serial.println(modulator->get_sm());
+					Serial.print("FIFO state - empty: ");
+					Serial.print(modulator->tx_fifo_empty());
+					Serial.print(", full: ");
+					Serial.println(modulator->tx_fifo_full());
+#else
+					Serial.print("Symbol rate: ");
+					Serial.print(modulator->get_symbolrate());
+					Serial.println(" Hz");
+#endif
+					break;
 				}
-				break;
+				case 'p': {
+					modulator->stop();
+					Serial.println("Modulation stopped");
+					break;
+				}
+				case 'i': {
+					Serial.print("Current symbol rate: ");
+					Serial.print(modulator->get_symbolrate());
+					Serial.println(" Hz");
+					break;
+				}
+				case 'v': {
+					bool current = modulator->get_invert_output();
+					modulator->set_invert_output(!current);
+					Serial.print("Output inversion: ");
+					Serial.println(!current ? "ON" : "OFF");
+					break;
+				}
+				case 'f': {
+					filler_enabled = !filler_enabled;
+					if (filler_enabled) {
+						modulator->init_frame();
+						modulator->restart_transmission();
+						Serial.println("Filler transmission enabled");
+					} else {
+						modulator->clear_frame();
+						Serial.println("Filler transmission disabled");
+					}
+					break;
+				}
+				case 'c': {
+					bool current = modulator->get_convolutional_encoding();
+					modulator->set_convolutional_encoding(!current);
+					Serial.print("CCSDS convolutional encoding: ");
+					Serial.println(!current ? "ON" : "OFF");
+					break;
+				}
+				case 'n': {
+					bool current = modulator->get_randomizer_enabled();
+					modulator->set_randomizer_enabled(!current);
+					Serial.print("CCSDS randomizer: ");
+					Serial.println(!current ? "ON" : "OFF");
+					break;
+				}
+				case 't': {
+					Serial.println("Enter message:");
+					waiting_for_input = true;
+					input_mode = 't';
+					input_idx = 0;
+					break;
+				}
+				case 'x': {
+					Serial.println("Reinitializing Si5351 LO");
+					init_si5351_lo();
+					break;
+				}
+				case 'm': {
+					reboot_microcontroller();
+					break;
+				}
+				default:
+					Serial.println("Unknown command");
+					break;
 			}
-			case 'x': {
-				Serial.println("Reinitializing Si5351 LO");
-				init_si5351_lo();
-				break;
-			}
-			case 'm': {
-				reboot_microcontroller();
-				break;
-			}
-			default:
-			  Serial.println("Unknown command");
-			  break;
-		  }
 		}
-  	}
+	}
 }
