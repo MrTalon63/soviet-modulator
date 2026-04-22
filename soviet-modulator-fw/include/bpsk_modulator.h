@@ -8,9 +8,10 @@
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
 #include <hardware/timer.h>
+#include <hardware/dma.h>
 
 #define USE_PIO_MODULATION 1
-#define FRAME_SIZE 128
+#define FRAME_SIZE 256
 #define MSG_BUFFER_SIZE 512
 static constexpr uint16_t TX_STREAM_SIZE = FRAME_SIZE * 2;
 static constexpr uint8_t CONV_G1 = 0x79; // 1111001b, 171 octal
@@ -53,6 +54,23 @@ static const uint8_t RANDOMIZER8_TABLE[255] = {
 
 const int CADU_ASM_SIZE = 4;
 
+constexpr uint8_t bpsk_parity8(uint8_t value) {
+    value ^= value >> 4;
+    value ^= value >> 2;
+    value ^= value >> 1;
+    return value & 1;
+}
+
+struct BPSKConvLutGen {
+    uint8_t lut[128];
+    constexpr BPSKConvLutGen() : lut{} {
+        for (int s = 0; s < 128; ++s) {
+            lut[s] = (bpsk_parity8((uint8_t)(s & CONV_G1)) << 1) | bpsk_parity8((uint8_t)(s & CONV_G2));
+        }
+    }
+};
+static constexpr BPSKConvLutGen CCSDS_CONV_LUT;
+
 static const uint16_t bpsk_modulator_program[] = {
     0x6001,
 };
@@ -66,6 +84,10 @@ static const pio_program_t bpsk_modulator_program_default = {
 class BPSKModulator;
 extern BPSKModulator* g_modulator_instance;
 
+#if USE_PIO_MODULATION
+extern void bpsk_dma_isr();
+#endif
+
 #if !USE_PIO_MODULATION
 extern bool bpsk_timer_callback(repeating_timer_t *rt);
 #endif
@@ -77,36 +99,49 @@ private:
     PIO pio;
     uint sm;
     uint pio_offset;
+    int dma_chan_0;
+    int dma_chan_1;
+    dma_channel_config c0;
+    dma_channel_config c1;
+    uint32_t dma_buf[2][128];
+    uint32_t tx_stream_len_words;
 #else
     repeating_timer_t timer;
     bool timer_active;
     uint8_t bit_index;
+    uint8_t tx_stream[TX_STREAM_SIZE];
+    uint16_t tx_stream_len;
+    uint16_t tx_index;
 #endif
     
     uint pin;
     uint32_t symbolrate_hz;
-    uint16_t tx_index;
     uint16_t msg_len;
     bool msg_pending;
     bool running;
-    bool restore_filler_after_message;
+    volatile bool restore_filler_after_message;
     bool invert_output;
     bool convolution_enabled;
     bool randomizer_enabled;
-    uint16_t tx_stream_len;
+    uint8_t pending_frame[FRAME_SIZE];
+    volatile bool pending_frame_valid;
+    uint8_t conv_shift_reg;
 
 public:
     uint8_t frame[FRAME_SIZE];
-    uint8_t tx_stream[TX_STREAM_SIZE];
     uint8_t msg_buffer[MSG_BUFFER_SIZE];
     
-    BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), tx_index(0), 
+    BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), 
           msg_len(0), msg_pending(false), running(false), restore_filler_after_message(false), invert_output(false),
-                        convolution_enabled(false), randomizer_enabled(true), tx_stream_len(0) {
+                    convolution_enabled(false), randomizer_enabled(true), pending_frame_valid(false), conv_shift_reg(0) {
+        g_modulator_instance = this;
 #if !USE_PIO_MODULATION
+        tx_stream_len = 0;
+        tx_index = 0;
         bit_index = 0;
         timer_active = false;
-        g_modulator_instance = this;
+#else
+        tx_stream_len_words = 0;
 #endif
         init_frame();
 #if USE_PIO_MODULATION
@@ -124,72 +159,57 @@ public:
 #endif
     }
 
-    static uint8_t parity8(uint8_t value) {
-        value ^= value >> 4;
-        value ^= value >> 2;
-        value ^= value >> 1;
-        return value & 1;
-    }
-
-    void build_tx_stream() {
-        uint16_t out_index = 0;
+#if !USE_PIO_MODULATION
+    void build_tx_stream_from_frame(const uint8_t *src_frame, uint8_t *out_stream, uint16_t *out_len) {
         if (!convolution_enabled) {
-            memcpy(tx_stream, frame, FRAME_SIZE);
-            tx_stream_len = FRAME_SIZE;
+            memcpy(out_stream, src_frame, FRAME_SIZE);
+            *out_len = FRAME_SIZE;
             return;
         }
 
-        uint8_t shift_reg = 0;
-        uint8_t packed_byte = 0;
-        uint8_t packed_bits = 0;
-
+        uint16_t out_index = 0;
         for (uint16_t i = 0; i < FRAME_SIZE; i++) {
-            uint8_t current_byte = frame[i];
+            uint8_t current_byte = src_frame[i];
+            uint16_t out_word = 0;
+
             for (int bit = 7; bit >= 0; bit--) {
                 uint8_t input_bit = (current_byte >> bit) & 0x01;
                 // CCSDS convention: newest input bit is at register bit 6.
-                shift_reg = (uint8_t)(((shift_reg >> 1) | (input_bit << 6)) & 0x7F);
-
-                uint8_t c1 = parity8(shift_reg & CONV_G1);
-                uint8_t c2 = parity8(shift_reg & CONV_G2);
-
-                packed_byte = (packed_byte << 1) | c1;
-                packed_bits++;
-                if (packed_bits >= 8) {
-                    tx_stream[out_index++] = packed_byte;
-                    packed_byte = 0;
-                    packed_bits = 0;
-                }
-
-                packed_byte = (packed_byte << 1) | c2;
-                packed_bits++;
-                if (packed_bits >= 8) {
-                    tx_stream[out_index++] = packed_byte;
-                    packed_byte = 0;
-                    packed_bits = 0;
-                }
+                conv_shift_reg = (uint8_t)(((conv_shift_reg >> 1) | (input_bit << 6)) & 0x7F);
+                out_word = (out_word << 2) | CCSDS_CONV_LUT.lut[conv_shift_reg];
             }
+
+            out_stream[out_index++] = (out_word >> 8) & 0xFF;
+            out_stream[out_index++] = out_word & 0xFF;
         }
 
-        if (packed_bits != 0) {
-            packed_byte <<= (8 - packed_bits);
-            tx_stream[out_index++] = packed_byte;
-        }
+        *out_len = out_index;
+    }
 
-        tx_stream_len = out_index;
+    void build_tx_stream() {
+        build_tx_stream_from_frame(frame, tx_stream, &tx_stream_len);
     }
 
     void prepare_tx_stream() {
         build_tx_stream();
         tx_index = 0;
-#if !USE_PIO_MODULATION
         bit_index = 0;
-#endif
     }
+#else
+    void prepare_tx_stream() {
+        // DMA prepares chunks synchronously via ISR. Empty wrapper preserves compatibility.
+    }
+#endif
 
     void randomize_frame_data(uint16_t start_index) {
         for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
             frame[i] ^= RANDOMIZER8_TABLE[(i - start_index) % 255];
+        }
+    }
+
+    void randomize_buffer_data(uint8_t *buffer, uint16_t start_index) {
+        for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
+            buffer[i] ^= RANDOMIZER8_TABLE[(i - start_index) % 255];
         }
     }
 
@@ -214,6 +234,53 @@ public:
         prepare_tx_stream();
     }
 
+    void init_frame_binary(const uint8_t *data, uint16_t len, bool prepacked_asm) {
+        memset(frame, 0x55, FRAME_SIZE);
+        if (prepacked_asm) {
+            for (uint16_t i = 0; i < len && i < FRAME_SIZE; i++)
+                frame[i] = data[i];
+        } else {
+            frame[0] = 0x1A;  frame[1] = 0xCF;  frame[2] = 0xFC;  frame[3] = 0x1D;
+            uint16_t pos = CADU_ASM_SIZE;
+            for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
+                frame[pos] = data[i];
+        }
+
+        if (randomizer_enabled) randomize_frame_data(CADU_ASM_SIZE);
+        prepare_tx_stream();
+    }
+
+    bool queue_binary_frame(const uint8_t *data, uint16_t len, bool prepacked_asm) {
+        if (pending_frame_valid) return false;
+
+        memset(pending_frame, 0x55, FRAME_SIZE);
+
+        if (prepacked_asm) {
+            for (uint16_t i = 0; i < len && i < FRAME_SIZE; i++) {
+                pending_frame[i] = data[i];
+            }
+        } else {
+            pending_frame[0] = 0x1A;
+            pending_frame[1] = 0xCF;
+            pending_frame[2] = 0xFC;
+            pending_frame[3] = 0x1D;
+            uint16_t pos = CADU_ASM_SIZE;
+            for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++) {
+                pending_frame[pos] = data[i];
+            }
+        }
+
+        if (randomizer_enabled && !prepacked_asm) {
+            randomize_buffer_data(pending_frame, CADU_ASM_SIZE);
+        }
+        restore_filler_after_message = true;
+        pending_frame_valid = true;
+        // Uploaded payload frame should be sent once, then fall back to filler.
+        return true;
+    }
+
+    bool can_queue_binary_frame() const { return !pending_frame_valid; }
+
     void init_frame_message_only(const uint8_t *msg, uint16_t len) {
         uint16_t pos = 0;
         for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
@@ -235,22 +302,22 @@ public:
 
     void clear_frame() {
         memset(frame, 0, FRAME_SIZE);
+        conv_shift_reg = 0;
         prepare_tx_stream();
         restart_transmission();
     }
 
     void set_convolutional_encoding(bool enabled) {
         convolution_enabled = enabled;
-        prepare_tx_stream();
-        restart_transmission();
+        conv_shift_reg = 0;
+        restore_filler_after_message = true;
     }
 
     bool get_convolutional_encoding() const { return convolution_enabled; }
 
     void set_randomizer_enabled(bool enabled) {
         randomizer_enabled = enabled;
-        init_frame();
-        restart_transmission();
+        restore_filler_after_message = true;
     }
 
     bool get_randomizer_enabled() const { return randomizer_enabled; }
@@ -258,35 +325,36 @@ public:
     void restart_transmission() {
 #if USE_PIO_MODULATION
         if (running) {
-            pio_sm_set_enabled(pio, sm, false);
-            pio_sm_clear_fifos(pio, sm);
-            pio_sm_restart(pio, sm);
-            pio_sm_set_enabled(pio, sm, true);
-            refill_fifo();
+            stop();
+            start();
         }
 #endif
     }
 
     void inject_message(bool filler_enabled) {
         if (!msg_pending || msg_len == 0) return;
+        if (pending_frame_valid) return;
+
         if (filler_enabled) {
-            init_frame_with_message(msg_buffer, msg_len);
+            pending_frame[0] = 0x1A;  pending_frame[1] = 0xCF;  pending_frame[2] = 0xFC;  pending_frame[3] = 0x1D;
+            uint16_t pos = CADU_ASM_SIZE;
+            for (uint16_t i = 0; i < msg_len && pos < FRAME_SIZE; i++, pos++) pending_frame[pos] = msg_buffer[i];
+            for (uint16_t i = pos; i < FRAME_SIZE; i++) pending_frame[i] = 0x55;
+            if (randomizer_enabled) randomize_buffer_data(pending_frame, CADU_ASM_SIZE);
             restore_filler_after_message = true;
         } else {
-            init_frame_message_only(msg_buffer, msg_len);
+            uint16_t pos = 0;
+            for (uint16_t i = 0; i < msg_len && pos < FRAME_SIZE; i++, pos++) pending_frame[pos] = msg_buffer[i];
+            for (uint16_t i = pos; i < FRAME_SIZE; i++) pending_frame[i] = 0x55;
+            if (randomizer_enabled) randomize_buffer_data(pending_frame, 0);
             restore_filler_after_message = false;
         }
+        pending_frame_valid = true;
         msg_pending = false;
-        tx_index = 0;
-#if !USE_PIO_MODULATION
-        bit_index = 0;
-#else
-        refill_fifo();
-#endif
     }
 
     void set_symbolrate(uint32_t hz) {
-        if (hz < 1 || hz > 100000) return;
+        if (hz < 1 || hz > 10000000) return;
         symbolrate_hz = hz;
 #if USE_PIO_MODULATION
         float clkdiv = (float)clock_get_hz(clk_sys) / (float)hz;
@@ -310,14 +378,63 @@ public:
         init_frame_pattern_55();
     }
 
-    void service() {
 #if USE_PIO_MODULATION
-        if (!running) return;
-        refill_fifo();
-#endif
+    void fill_dma_buffer(uint32_t *out_buf) {
+        if (pending_frame_valid) {
+            memcpy(frame, pending_frame, FRAME_SIZE);
+            pending_frame_valid = false;
+        } else if (restore_filler_after_message) {
+            memset(frame, 0x55, FRAME_SIZE);
+            frame[0] = 0x1A;
+            frame[1] = 0xCF;
+            frame[2] = 0xFC;
+            frame[3] = 0x1D;
+            if (randomizer_enabled) randomize_frame_data(CADU_ASM_SIZE);
+            restore_filler_after_message = false;
+        }
+
+        uint32_t words_written = 0;
+        if (!convolution_enabled) {
+            for (uint16_t i = 0; i < FRAME_SIZE; i += 4) {
+                uint32_t word = ((uint32_t)frame[i] << 24) | ((uint32_t)frame[i+1] << 16) | ((uint32_t)frame[i+2] << 8) | (uint32_t)frame[i+3];
+                if (invert_output) word ^= 0xFFFFFFFF;
+                out_buf[words_written++] = word;
+            }
+        } else {
+            for (uint16_t i = 0; i < FRAME_SIZE; i += 2) {
+                uint32_t word = 0;
+                for (int b = 0; b < 2; b++) {
+                    uint8_t current_byte = frame[i + b];
+                    uint16_t out_word = 0;
+                    for (int bit = 7; bit >= 0; bit--) {
+                        uint8_t input_bit = (current_byte >> bit) & 0x01;
+                        conv_shift_reg = (uint8_t)(((conv_shift_reg >> 1) | (input_bit << 6)) & 0x7F);
+                        out_word = (out_word << 2) | CCSDS_CONV_LUT.lut[conv_shift_reg];
+                    }
+                    word = (word << 16) | out_word;
+                }
+                if (invert_output) word ^= 0xFFFFFFFF;
+                out_buf[words_written++] = word;
+            }
+        }
+        tx_stream_len_words = words_written;
     }
 
-#if USE_PIO_MODULATION
+    void handle_dma_irq() {
+        if (dma_channel_get_irq0_status(dma_chan_0)) {
+            dma_channel_acknowledge_irq0(dma_chan_0);
+            fill_dma_buffer(dma_buf[0]);
+            dma_channel_set_trans_count(dma_chan_0, tx_stream_len_words, false);
+            dma_channel_set_read_addr(dma_chan_0, dma_buf[0], false);
+        }
+        if (dma_channel_get_irq0_status(dma_chan_1)) {
+            dma_channel_acknowledge_irq0(dma_chan_1);
+            fill_dma_buffer(dma_buf[1]);
+            dma_channel_set_trans_count(dma_chan_1, tx_stream_len_words, false);
+            dma_channel_set_read_addr(dma_chan_1, dma_buf[1], false);
+        }
+    }
+
     void init_pio(uint pin) {
         pio = pio0;
         pio_offset = pio_add_program(pio, &bpsk_modulator_program_default);
@@ -325,7 +442,7 @@ public:
         pio_sm_config c = pio_get_default_sm_config();
         sm_config_set_out_pins(&c, pin, 1);
         sm_config_set_wrap(&c, pio_offset, pio_offset);
-        sm_config_set_out_shift(&c, false, true, 8);
+        sm_config_set_out_shift(&c, false, true, 32);
         sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
         pio_gpio_init(pio, pin);
         pio_sm_clear_fifos(pio, sm);
@@ -333,26 +450,31 @@ public:
         pio_sm_init(pio, sm, pio_offset, &c);
         pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
         set_symbolrate(symbolrate_hz);
-        refill_fifo();
-        pio_sm_set_enabled(pio, sm, true);
-        running = true;
-    }
 
-    void refill_fifo() {
-        while (!pio_sm_is_tx_fifo_full(pio, sm)) {
-            if (tx_index >= tx_stream_len) {
-                tx_index = 0;
-                if (restore_filler_after_message) {
-                    init_frame();
-                    restore_filler_after_message = false;
-                }
-            }
+        dma_chan_0 = dma_claim_unused_channel(true);
+        dma_chan_1 = dma_claim_unused_channel(true);
 
-            uint8_t tx_byte = tx_stream[tx_index];
-            if (invert_output) tx_byte ^= 0xFF;
-            pio_sm_put(pio, sm, (uint32_t)tx_byte << 24);
-            tx_index++;
-        }
+        c0 = dma_channel_get_default_config(dma_chan_0);
+        channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);
+        channel_config_set_read_increment(&c0, true);
+        channel_config_set_write_increment(&c0, false);
+        channel_config_set_dreq(&c0, pio_get_dreq(pio, sm, true));
+        channel_config_set_chain_to(&c0, dma_chan_1);
+        dma_channel_set_config(dma_chan_0, &c0, false);
+
+        c1 = dma_channel_get_default_config(dma_chan_1);
+        channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
+        channel_config_set_read_increment(&c1, true);
+        channel_config_set_write_increment(&c1, false);
+        channel_config_set_dreq(&c1, pio_get_dreq(pio, sm, true));
+        channel_config_set_chain_to(&c1, dma_chan_0);
+        dma_channel_set_config(dma_chan_1, &c1, false);
+
+        dma_channel_set_irq0_enabled(dma_chan_0, true);
+        dma_channel_set_irq0_enabled(dma_chan_1, true);
+
+        irq_set_exclusive_handler(DMA_IRQ_0, bpsk_dma_isr);
+        irq_set_enabled(DMA_IRQ_0, true);
     }
 
     bool tx_fifo_empty() const { return pio_sm_is_tx_fifo_empty(pio, sm); }
@@ -365,14 +487,22 @@ public:
         pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
         pio_sm_clear_fifos(pio, sm);
         pio_sm_restart(pio, sm);
-        tx_index = 0;
-        refill_fifo();
+
+        fill_dma_buffer(dma_buf[0]);
+        fill_dma_buffer(dma_buf[1]);
+
+        dma_channel_configure(dma_chan_0, &c0, &pio->txf[sm], dma_buf[0], tx_stream_len_words, false);
+        dma_channel_configure(dma_chan_1, &c1, &pio->txf[sm], dma_buf[1], tx_stream_len_words, false);
+
         pio_sm_set_enabled(pio, sm, true);
+        dma_channel_start(dma_chan_0);
         running = true;
     }
 
     void stop() {
         pio_sm_set_enabled(pio, sm, false);
+        dma_channel_abort(dma_chan_0);
+        dma_channel_abort(dma_chan_1);
         running = false;
     }
 
@@ -384,7 +514,25 @@ public:
     }
 
     void output_next_bit() {
-        if (!running || tx_index >= tx_stream_len) return;
+        if (!running) return;
+
+        if (tx_index >= tx_stream_len) {
+            tx_index = 0;
+            if (pending_frame_valid) {
+                memcpy(frame, pending_frame, FRAME_SIZE);
+                pending_frame_valid = false;
+            } else if (restore_filler_after_message) {
+                memset(frame, 0x55, FRAME_SIZE);
+                frame[0] = 0x1A;
+                frame[1] = 0xCF;
+                frame[2] = 0xFC;
+                frame[3] = 0x1D;
+                if (randomizer_enabled) randomize_frame_data(CADU_ASM_SIZE);
+                restore_filler_after_message = false;
+            }
+            build_tx_stream();
+        }
+
         uint8_t current_byte = tx_stream[tx_index];
         uint8_t bit = (current_byte >> (7 - bit_index)) & 0x01;
         if (invert_output) bit ^= 0x01;
@@ -393,13 +541,6 @@ public:
         if (bit_index >= 8) {
             bit_index = 0;
             tx_index++;
-            if (tx_index >= tx_stream_len) {
-                tx_index = 0;
-                if (restore_filler_after_message) {
-                    init_frame();
-                    restore_filler_after_message = false;
-                }
-            }
         }
     }
 
@@ -431,6 +572,14 @@ public:
 };
 
 BPSKModulator* g_modulator_instance = nullptr;
+
+#if USE_PIO_MODULATION
+void bpsk_dma_isr() {
+    if (g_modulator_instance != nullptr) {
+        g_modulator_instance->handle_dma_irq();
+    }
+}
+#endif
 
 #if !USE_PIO_MODULATION
 bool bpsk_timer_callback(repeating_timer_t *rt) {
