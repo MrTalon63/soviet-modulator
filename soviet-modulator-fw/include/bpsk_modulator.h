@@ -63,7 +63,8 @@ struct BPSKRandomizerFastLut {
         }
     }
 };
-static constexpr BPSKRandomizerFastLut CCSDS_RANDOMIZER_FAST_LUT;
+// Removed constexpr to force the table into RAM to prevent Flash XIP cache misses
+static BPSKRandomizerFastLut CCSDS_RANDOMIZER_FAST_LUT;
 
 constexpr uint8_t bpsk_parity8(uint8_t value) {
     value ^= value >> 4;
@@ -101,11 +102,12 @@ struct BPSKConvFastLut {
         }
     }
 };
-static constexpr BPSKConvFastLut CCSDS_CONV_FAST_LUT;
+// Removed constexpr to force the table into RAM to prevent Flash XIP cache misses
+static BPSKConvFastLut CCSDS_CONV_FAST_LUT;
 
-static const uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
-static const uint8_t PUNC_C1[] = { 0b1, 0b01, 0b101, 0b10101, 0b1010001 };
-static const uint8_t PUNC_C2[] = { 0b1, 0b11, 0b011, 0b01011, 0b0101111 };
+static uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
+static uint8_t PUNC_C1[] = { 0b1, 0b01, 0b101, 0b10101, 0b1010001 };
+static uint8_t PUNC_C2[] = { 0b1, 0b11, 0b011, 0b01011, 0b0101111 };
 
 static const uint16_t bpsk_modulator_program[] = {
     0x6001,
@@ -133,7 +135,7 @@ private:
     dma_channel_config c0;
     dma_channel_config c1;
     
-    static constexpr int DMA_BUFFER_MULTIPLIER = 4;
+    static constexpr int DMA_BUFFER_MULTIPLIER = 8;
     uint32_t dma_buf[2][(FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER];
     
     uint pin;
@@ -151,7 +153,7 @@ private:
     uint16_t fec_input_buffer_len;
 
     // Deep enough to absorb math delays, small enough to prevent Out-Of-Memory crashes
-    static constexpr int PENDING_FRAME_QUEUE_SIZE = 16;
+    static constexpr int PENDING_FRAME_QUEUE_SIZE = 32;
     queue_t pending_frame_queue;
 
     struct alignas(4) DmaChunk {
@@ -171,7 +173,7 @@ private:
     uint8_t conv_rate;
     alignas(4) uint8_t filler_frame[FRAME_SIZE];
 
-    static constexpr int DMA_CHUNK_QUEUE_SIZE = 16;
+    static constexpr int DMA_CHUNK_QUEUE_SIZE = 32;
     queue_t dma_chunk_queue;
 
     void flush_dma_chunks() {
@@ -644,8 +646,8 @@ public:
         if (queue_is_full(&dma_chunk_queue)) return false;
 
         if (!pop_pending_frame(current_tx_frame)) {
-            // Keep a massive 14-chunk DMA buffer to guarantee the radio never loses Viterbi lock
-            if (get_dma_chunks_count() > 14) {
+            // Keep a massive 28-chunk DMA buffer to guarantee the radio never loses Viterbi lock
+            if (get_dma_chunks_count() > 28) {
                 return false; // Queue is healthy, don't spam filler frames. Yield to let feed_modulator run.
             }
             // Always copy to the local buffer to ensure consistent memory access patterns

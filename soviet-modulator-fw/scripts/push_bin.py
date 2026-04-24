@@ -61,7 +61,7 @@ def print_drain_progress(current, total):
 def main():
     parser = argparse.ArgumentParser(description="Upload binary frames to BPSK Modulator")
     parser.add_argument("port", help="Serial port (e.g., COM3 or /dev/ttyACM0)")
-    parser.add_argument("--baud", type=int, default=921600, help="Baud rate (default 921600)")
+    parser.add_argument("--baud", type=int, default=12000000, help="Baud rate (default 12000000 to uncap OS driver)")
     parser.add_argument("--rate", type=int, help="Set symbol rate (Hz)")
     parser.add_argument("--crate", type=int, choices=[0,1,2,3,4], help="Set convolutional puncturing rate (0=1/2, 1=2/3, 2=3/4, 3=5/6, 4=7/8)")
     parser.add_argument("--rs", type=int, choices=[0,1], help="0=Disable, 1=Enable Reed-Solomon")
@@ -169,7 +169,7 @@ def main():
     start_time = time.time()
     last_ui_update = 0
     
-    window_size = 16 # Conservative sliding window for rock-solid stability
+    window_size = 128 # Aggressive sliding window to saturate the USB pipe and overcome OS polling latency
     in_flight = 0
     chunk_ready_to_read = True
 
@@ -183,30 +183,30 @@ def main():
                     print("\n\nError: MCU rejected the chunk size. Disconnecting.")
                     sys.exit(1)
 
-            # 2. Write one chunk at a time and pull ACKs instantly to prevent circular deadlocks!
-            while in_flight < window_size and chunk_ready_to_read:
+            # 2. Batch read/serialize to blast to the OS in one massive USB Bulk Transfer
+            payload_batch = bytearray()
+            chunks_added = 0
+            
+            while in_flight + chunks_added < window_size and chunk_ready_to_read and len(payload_batch) < 32768:
                 chunk = f.read(chunk_size)
                 if not chunk:
                     chunk_ready_to_read = False
                     break
                 
-                payload = len(chunk).to_bytes(2, byteorder='little') + chunk
+                payload_batch.extend(len(chunk).to_bytes(2, byteorder='little'))
+                payload_batch.extend(chunk)
+                chunks_added += 1
+                bytes_sent += len(chunk)
+                
+            if chunks_added > 0:
                 try:
-                    ser.write(payload)
+                    ser.write(payload_batch)
                 except serial.SerialTimeoutException:
                     print("\n\nError: USB Write Timeout. The MCU stopped reading data.")
                     sys.exit(1)
-                in_flight += 1
-                bytes_sent += len(chunk)
                 
-                # Instantly clear MCU TX buffer
-                if ser.in_waiting > 0:
-                    err_check = ser.read(ser.in_waiting)
-                    in_flight -= err_check.count(b'K')
-                    if b'E' in err_check:
-                        print("\n\nError: MCU rejected the chunk size. Disconnecting.")
-                        sys.exit(1)
-                        
+                in_flight += chunks_added
+                
                 now = time.time()
                 if now - last_ui_update > 0.2: # Update console at 5Hz to prevent terminal lag
                     print_progress(bytes_sent, total_size, start_time)

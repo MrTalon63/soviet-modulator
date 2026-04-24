@@ -48,8 +48,8 @@ struct BinaryQueueItem {
     bool prepacked_asm;
 };
 
-// Set to ~128 KB queue to leave a massive 300+ KB buffer for CPU stacks and USB drivers
-static constexpr uint16_t BINARY_QUEUE_CAPACITY = (131072 / sizeof(BinaryQueueItem)) > 0 ? (131072 / sizeof(BinaryQueueItem)) : 2; 
+// Set to ~256 KB queue to use more of our free RAM for maximum USB jitter resilience
+static constexpr uint16_t BINARY_QUEUE_CAPACITY = (262144 / sizeof(BinaryQueueItem)) > 0 ? (262144 / sizeof(BinaryQueueItem)) : 2; 
 static queue_t binary_queue;
 static uint32_t binary_frames_enqueued_total = 0;
 static uint32_t binary_frames_dequeued_total = 0;
@@ -246,7 +246,7 @@ void print_help() {
 
 void setup() {
 	delay(100); // Allow hardware peripherals (Si5351) a fraction of a second to cleanly power up
-	//set_sys_clock_khz(250000, true); // Overclock RP2350 to 250 MHz for high-speed stability
+	set_sys_clock_khz(250000, true); // Overclock RP2350 to 250 MHz for high-speed stability
 
 	queue_init(&binary_queue, sizeof(BinaryQueueItem), BINARY_QUEUE_CAPACITY);
 
