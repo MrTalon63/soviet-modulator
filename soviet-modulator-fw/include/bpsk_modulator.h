@@ -12,9 +12,11 @@
 #include "pico/util/queue.h"
 
 #include "rs.h"
-#define FRAME_SIZE 1024
-#define MSG_BUFFER_SIZE 512
-static constexpr uint16_t TX_STREAM_SIZE = FRAME_SIZE * 2;
+
+#define MAX_FRAME_SIZE 4084
+#define MAX_MSG_BUFFER_SIZE 4084
+#define MAX_FEC_INPUT_SIZE 3568
+
 static constexpr uint8_t CONV_G1 = 0x79; // 1111001b, 171 octal
 static constexpr uint8_t CONV_G2 = 0x5B; // 1011011b, 133 octal
 // CCSDS legacy 8-bit randomizer table used by SatDump.
@@ -56,14 +58,13 @@ static constexpr uint8_t RANDOMIZER8_TABLE[255] = {
 const int CADU_ASM_SIZE = 4;
 
 struct BPSKRandomizerFastLut {
-    uint8_t seq[FRAME_SIZE];
+    uint8_t seq[MAX_FRAME_SIZE];
     constexpr BPSKRandomizerFastLut() : seq{} {
-        for (int i = 0; i < FRAME_SIZE; i++) {
+        for (int i = 0; i < MAX_FRAME_SIZE; i++) {
             seq[i] = RANDOMIZER8_TABLE[i % 255];
         }
     }
 };
-// Removed constexpr to force the table into RAM to prevent Flash XIP cache misses
 static BPSKRandomizerFastLut CCSDS_RANDOMIZER_FAST_LUT;
 
 constexpr uint8_t bpsk_parity8(uint8_t value) {
@@ -102,7 +103,6 @@ struct BPSKConvFastLut {
         }
     }
 };
-// Removed constexpr to force the table into RAM to prevent Flash XIP cache misses
 static BPSKConvFastLut CCSDS_CONV_FAST_LUT;
 
 static uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
@@ -135,8 +135,8 @@ private:
     dma_channel_config c0;
     dma_channel_config c1;
     
-    static constexpr int DMA_BUFFER_MULTIPLIER = 8;
-    uint32_t dma_buf[2][(FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER];
+    static constexpr int DMA_BUFFER_TOTAL_WORDS = 4096;
+    uint32_t dma_buf[2][DMA_BUFFER_TOTAL_WORDS];
     
     uint pin;
     uint32_t symbolrate_hz;
@@ -148,32 +148,41 @@ private:
     bool randomizer_enabled;
     bool reed_solomon_enabled;
     bool dual_basis_enabled;
+    uint8_t rs_interleave;
+    uint16_t current_frame_size;
+    uint16_t current_payload_size;
 
-    alignas(4) uint8_t fec_input_buffer[892];
+    alignas(4) uint8_t fec_input_buffer[MAX_FEC_INPUT_SIZE];
     uint16_t fec_input_buffer_len;
 
     // Deep enough to absorb math delays, small enough to prevent Out-Of-Memory crashes
-    static constexpr int PENDING_FRAME_QUEUE_SIZE = 32;
+    static constexpr int PENDING_FRAME_QUEUE_SIZE = 8;
     queue_t pending_frame_queue;
 
+    struct alignas(4) PendingFrame {
+        uint8_t data[MAX_FRAME_SIZE];
+        uint16_t length;
+    };
+
     struct alignas(4) DmaChunk {
-        uint32_t words[FRAME_SIZE / 2];
+        uint32_t words[2048]; // Max 2048 words (8192 bytes) securely handles Convolutional 1/2 expanding a 4084 byte frame
         uint32_t length; // 32-bit perfectly aligns struct for ARM LDM/STM memory copies
     };
 
-    alignas(4) uint8_t current_tx_frame[FRAME_SIZE];
+    alignas(4) PendingFrame current_tx_pf;
+    alignas(4) PendingFrame staging_pf;
     alignas(4) DmaChunk dma_generation_chunk;
     alignas(4) DmaChunk dma_irq_chunk;
-    alignas(4) uint8_t rs_cadu_buffer[FRAME_SIZE];
+    alignas(4) uint8_t rs_cadu_buffer[MAX_FRAME_SIZE];
 
     uint8_t conv_shift_reg;
     alignas(4) uint32_t tx_accum_data;
     uint8_t tx_accum_bits;
     uint8_t punc_phase;
     uint8_t conv_rate;
-    alignas(4) uint8_t filler_frame[FRAME_SIZE];
+    alignas(4) uint8_t filler_frame[MAX_FRAME_SIZE];
 
-    static constexpr int DMA_CHUNK_QUEUE_SIZE = 32;
+    static constexpr int DMA_CHUNK_QUEUE_SIZE = 8;
     queue_t dma_chunk_queue;
 
     void flush_dma_chunks() {
@@ -182,8 +191,8 @@ private:
     }
 
     void flush_pending_frames() {
-        static uint8_t dummy[FRAME_SIZE];
-        while (queue_try_remove(&pending_frame_queue, dummy));
+        static PendingFrame dummy;
+        while (queue_try_remove(&pending_frame_queue, &dummy));
     }
 
     uint8_t get_dma_chunks_count() const {
@@ -201,8 +210,8 @@ private:
     }
 
 public:
-    alignas(4) uint8_t frame[FRAME_SIZE];
-    alignas(4) uint8_t msg_buffer[MSG_BUFFER_SIZE];
+    alignas(4) uint8_t frame[MAX_FRAME_SIZE];
+    alignas(4) uint8_t msg_buffer[MAX_MSG_BUFFER_SIZE];
     volatile bool config_lock;
     
     void lock_config() {
@@ -220,11 +229,12 @@ public:
     BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), 
           msg_len(0), msg_pending(false), running(false), restore_filler_after_message(false),
                     convolution_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
+                    rs_interleave(4), current_frame_size(CADU_ASM_SIZE + (255 * 4)), current_payload_size(223 * 4),
                     fec_input_buffer_len(0),
                     conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
                     config_lock(false) {
         g_modulator_instance = this;
-        queue_init(&pending_frame_queue, FRAME_SIZE, PENDING_FRAME_QUEUE_SIZE);
+        queue_init(&pending_frame_queue, sizeof(PendingFrame), PENDING_FRAME_QUEUE_SIZE);
         queue_init(&dma_chunk_queue, sizeof(DmaChunk), DMA_CHUNK_QUEUE_SIZE);
         build_filler_frame();
         init_frame();
@@ -244,46 +254,36 @@ public:
     }
 
     void randomize_frame_data(uint16_t start_index) {
-        for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
+        for (uint16_t i = start_index; i < current_frame_size; i++) {
             frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - start_index];
         }
     }
 
-    void randomize_buffer_data(uint8_t *buffer, uint16_t start_index) {
-        for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
+    void randomize_buffer_data(uint8_t *buffer, uint16_t start_index, uint16_t len) {
+        for (uint16_t i = start_index; i < len; i++) {
             buffer[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - start_index];
         }
     }
 
     void build_filler_frame() {
         if (reed_solomon_enabled) {
-            static const int I = 4;
             static const int RS_K = 223;
             static const int RS_N = 255;
-            static const int RS_ENCODED_SIZE = I * RS_N; // 1020
+            int RS_ENCODED_SIZE = rs_interleave * RS_N;
 
             filler_frame[0] = 0x1A;
             filler_frame[1] = 0xCF;
             filler_frame[2] = 0xFC;
             filler_frame[3] = 0x1D;
 
-            uint8_t rs_input[223 * 4];
-            memset(rs_input, 0x55, sizeof(rs_input));
+            memset(filler_frame + CADU_ASM_SIZE, 0x55, RS_K * rs_interleave);
 
-            for (int i = 0; i < I; i++) {
-                uint8_t msg[RS_K];
-                for (int c = 0; c < RS_K; c++) {
-                    msg[c] = rs_input[c * I + i];
-                }
-                
+            for (int i = 0; i < rs_interleave; i++) {
                 uint8_t parity[RS_N - RS_K];
-                rs_encode(msg, parity);
+                rs_encode(filler_frame + CADU_ASM_SIZE, parity, i, rs_interleave);
 
-                for (int c = 0; c < RS_K; c++) {
-                    filler_frame[CADU_ASM_SIZE + c * I + i] = msg[c];
-                }
                 for (int c = 0; c < (RS_N - RS_K); c++) {
-                    filler_frame[CADU_ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                    filler_frame[CADU_ASM_SIZE + RS_K * rs_interleave + c * rs_interleave + i] = parity[c];
                 }
             }
 
@@ -297,13 +297,13 @@ public:
                 }
             }
         } else {
-            memset(filler_frame, 0x55, FRAME_SIZE);
+            memset(filler_frame, 0x55, current_frame_size);
             filler_frame[0] = 0x1A;
             filler_frame[1] = 0xCF;
             filler_frame[2] = 0xFC;
             filler_frame[3] = 0x1D;
             if (randomizer_enabled) {
-                randomize_buffer_data(filler_frame, CADU_ASM_SIZE);
+                randomize_buffer_data(filler_frame, CADU_ASM_SIZE, current_frame_size);
             }
         }
     }
@@ -311,23 +311,23 @@ public:
     void init_frame_with_message(const uint8_t *msg, uint16_t len) {
         frame[0] = 0x1A;  frame[1] = 0xCF;  frame[2] = 0xFC;  frame[3] = 0x1D;
         uint16_t pos = CADU_ASM_SIZE;
-        for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
+        for (uint16_t i = 0; i < len && pos < current_frame_size; i++, pos++)
             frame[pos] = msg[i];
-        for (uint16_t i = pos; i < FRAME_SIZE; i++)
+        for (uint16_t i = pos; i < current_frame_size; i++)
             frame[i] = 0x55;
         if (randomizer_enabled) randomize_frame_data(CADU_ASM_SIZE);
         prepare_tx_stream();
     }
 
     void init_frame_binary(const uint8_t *data, uint16_t len, bool prepacked_asm) {
-        memset(frame, 0x55, FRAME_SIZE);
+        memset(frame, 0x55, current_frame_size);
         if (prepacked_asm) {
-            for (uint16_t i = 0; i < len && i < FRAME_SIZE; i++)
+            for (uint16_t i = 0; i < len && i < current_frame_size; i++)
                 frame[i] = data[i];
         } else {
             frame[0] = 0x1A;  frame[1] = 0xCF;  frame[2] = 0xFC;  frame[3] = 0x1D;
             uint16_t pos = CADU_ASM_SIZE;
-            for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
+            for (uint16_t i = 0; i < len && pos < current_frame_size; i++, pos++)
                 frame[pos] = data[i];
         }
 
@@ -339,40 +339,35 @@ public:
         return queue_get_level(const_cast<queue_t*>(&pending_frame_queue));
     }
 
-    bool push_pending_frame(const uint8_t* frame_data) {
-        return queue_try_add(&pending_frame_queue, frame_data);
+    bool push_pending_frame(const uint8_t* frame_data, uint16_t len) {
+        memcpy(staging_pf.data, frame_data, len);
+        staging_pf.length = len;
+        return queue_try_add(&pending_frame_queue, &staging_pf);
     }
 
-    bool pop_pending_frame(uint8_t* frame_data) {
-        return queue_try_remove(&pending_frame_queue, frame_data);
+    bool pop_pending_frame(PendingFrame* pf) {
+        return queue_try_remove(&pending_frame_queue, pf);
     }
 
     void process_rs_buffer() {
-        static const int I = 4;
         static const int RS_K = 223;
         static const int RS_N = 255;
-        static const int RS_ENCODED_SIZE = I * RS_N; // 1020
-        static const int CADU_SIZE = CADU_ASM_SIZE + RS_ENCODED_SIZE; // 1024
+        int RS_ENCODED_SIZE = rs_interleave * RS_N;
+        int CADU_SIZE = CADU_ASM_SIZE + RS_ENCODED_SIZE;
 
         rs_cadu_buffer[0] = 0x1A;
         rs_cadu_buffer[1] = 0xCF;
         rs_cadu_buffer[2] = 0xFC;
         rs_cadu_buffer[3] = 0x1D;
 
-        for (int i = 0; i < I; i++) {
-            uint8_t msg[RS_K];
-            for (int c = 0; c < RS_K; c++) {
-                msg[c] = fec_input_buffer[c * I + i];
-            }
-            
-            uint8_t parity[RS_N - RS_K];
-            rs_encode(msg, parity);
+        memcpy(rs_cadu_buffer + CADU_ASM_SIZE, fec_input_buffer, RS_K * rs_interleave);
 
-            for (int c = 0; c < RS_K; c++) {
-                rs_cadu_buffer[CADU_ASM_SIZE + c * I + i] = msg[c];
-            }
+        for (int i = 0; i < rs_interleave; i++) {
+            uint8_t parity[RS_N - RS_K];
+            rs_encode(fec_input_buffer, parity, i, rs_interleave);
+
             for (int c = 0; c < (RS_N - RS_K); c++) {
-                rs_cadu_buffer[CADU_ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                rs_cadu_buffer[CADU_ASM_SIZE + RS_K * rs_interleave + c * rs_interleave + i] = parity[c];
             }
         }
 
@@ -387,9 +382,7 @@ public:
             }
         }
 
-        for (int i = 0; i < CADU_SIZE / FRAME_SIZE; i++) {
-            push_pending_frame(&rs_cadu_buffer[i * FRAME_SIZE]);
-        }
+        push_pending_frame(rs_cadu_buffer, CADU_SIZE);
         
         restore_filler_after_message = true;
     }
@@ -399,20 +392,20 @@ public:
 
         if (!reed_solomon_enabled) {
             init_frame_binary(data, len, prepacked_asm);
-            return push_pending_frame(frame);
+            return push_pending_frame(frame, current_frame_size);
         }
 
         uint16_t data_copied = 0;
         while(data_copied < len) {
             uint16_t to_copy = len - data_copied;
-            uint16_t space_left = sizeof(fec_input_buffer) - fec_input_buffer_len;
+            uint16_t space_left = current_payload_size - fec_input_buffer_len;
             if (to_copy > space_left) to_copy = space_left;
             
             memcpy(fec_input_buffer + fec_input_buffer_len, data + data_copied, to_copy);
             fec_input_buffer_len += to_copy;
             data_copied += to_copy;
 
-            if (fec_input_buffer_len == sizeof(fec_input_buffer)) {
+            if (fec_input_buffer_len == current_payload_size) {
                 if (reed_solomon_enabled) process_rs_buffer();
                 fec_input_buffer_len = 0;
             }
@@ -436,16 +429,16 @@ public:
 
     void init_frame_message_only(const uint8_t *msg, uint16_t len) {
         uint16_t pos = 0;
-        for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
+        for (uint16_t i = 0; i < len && pos < current_frame_size; i++, pos++)
             frame[pos] = msg[i];
-        for (uint16_t i = pos; i < FRAME_SIZE; i++)
+        for (uint16_t i = pos; i < current_frame_size; i++)
             frame[i] = 0x55;
         if (randomizer_enabled) randomize_frame_data(0);
         prepare_tx_stream();
     }
 
     void queue_message(const uint8_t *msg, uint16_t len) {
-        if (len > MSG_BUFFER_SIZE) len = MSG_BUFFER_SIZE;
+        if (len > MAX_MSG_BUFFER_SIZE) len = MAX_MSG_BUFFER_SIZE;
         memcpy(msg_buffer, msg, len);
         msg_len = len;
         msg_pending = true;
@@ -458,7 +451,7 @@ public:
         bool was_running = running;
         if (was_running) stop();
         
-        memset(frame, 0, FRAME_SIZE);
+        memset(frame, 0, current_frame_size);
         clear_baseband_state();
         prepare_tx_stream();
         
@@ -509,8 +502,13 @@ public:
         if (was_running) stop();
         
         reed_solomon_enabled = enabled;
-        if (!enabled) {
+        if (enabled) {
+            current_frame_size = CADU_ASM_SIZE + (255 * rs_interleave);
+            current_payload_size = 223 * rs_interleave;
+        } else {
             dual_basis_enabled = false;
+            current_frame_size = 1024;
+            current_payload_size = 1020;
         }
         clear_baseband_state();
         build_filler_frame();
@@ -521,9 +519,34 @@ public:
 
     bool get_reed_solomon_enabled() const { return reed_solomon_enabled; }
 
+    void set_rs_interleave(uint8_t depth) {
+        if (depth != 1 && depth != 2 && depth != 4 && depth != 8 && depth != 16) return;
+        if (rs_interleave == depth) return;
+        
+        lock_config();
+        bool was_running = running;
+        if (was_running) stop();
+        
+        rs_interleave = depth;
+        if (reed_solomon_enabled) {
+            current_frame_size = CADU_ASM_SIZE + (255 * depth);
+            current_payload_size = 223 * depth;
+        }
+        
+        clear_baseband_state();
+        build_filler_frame();
+        
+        if (was_running) start();
+        unlock_config();
+    }
+
+    uint8_t get_rs_interleave() const { return rs_interleave; }
+    uint16_t get_frame_size() const { return current_frame_size; }
+    uint16_t get_payload_size() const { return current_payload_size; }
+
     void flush_fec_buffer() {
         if (fec_input_buffer_len > 0) {
-            memset(fec_input_buffer + fec_input_buffer_len, 0x55, sizeof(fec_input_buffer) - fec_input_buffer_len);
+            memset(fec_input_buffer + fec_input_buffer_len, 0x55, current_payload_size - fec_input_buffer_len);
             if (reed_solomon_enabled) process_rs_buffer();
             fec_input_buffer_len = 0;
         }
@@ -585,20 +608,20 @@ public:
             } else {
                 init_frame_message_only(msg_buffer, msg_len);
             }
-            push_pending_frame(frame);
+            push_pending_frame(frame, current_frame_size);
         } else {
             // Buffer for FEC encoding
             uint16_t data_copied = 0;
             while(data_copied < msg_len) {
                 uint16_t to_copy = msg_len - data_copied;
-                uint16_t space_left = sizeof(fec_input_buffer) - fec_input_buffer_len;
+                uint16_t space_left = current_payload_size - fec_input_buffer_len;
                 if (to_copy > space_left) to_copy = space_left;
 
                 memcpy(fec_input_buffer + fec_input_buffer_len, msg_buffer + data_copied, to_copy);
                 fec_input_buffer_len += to_copy;
                 data_copied += to_copy;
 
-                if (fec_input_buffer_len == sizeof(fec_input_buffer)) {
+                if (fec_input_buffer_len == current_payload_size) {
                     if (reed_solomon_enabled) process_rs_buffer();
                     fec_input_buffer_len = 0;
                 }
@@ -638,44 +661,84 @@ public:
     }
 
     void init_frame() {
-        memcpy(frame, filler_frame, FRAME_SIZE);
+        memcpy(frame, filler_frame, current_frame_size);
         prepare_tx_stream();
     }
 
     bool process_baseband_to_dma() {
         if (queue_is_full(&dma_chunk_queue)) return false;
 
-        if (!pop_pending_frame(current_tx_frame)) {
+        if (!pop_pending_frame(&current_tx_pf)) {
             // Keep a massive 28-chunk DMA buffer to guarantee the radio never loses Viterbi lock
             if (get_dma_chunks_count() > 28) {
                 return false; // Queue is healthy, don't spam filler frames. Yield to let feed_modulator run.
             }
             // Always copy to the local buffer to ensure consistent memory access patterns
-            memcpy(current_tx_frame, filler_frame, FRAME_SIZE);
+            memcpy(current_tx_pf.data, filler_frame, current_frame_size);
+            current_tx_pf.length = current_frame_size;
         }
 
         uint32_t words_written = 0;
+        uint16_t len = current_tx_pf.length;
+        uint16_t words = len / 4;
+        uint8_t* pf_data = (uint8_t*)current_tx_pf.data;
 
         if (!convolution_enabled) {
-            uint32_t* frame_words = (uint32_t*)current_tx_frame;
-            for (uint16_t i = 0; i < FRAME_SIZE / 4; i++) {
-                uint32_t word = __builtin_bswap32(frame_words[i]);
+            uint32_t* frame_words = (uint32_t*)current_tx_pf.data;
+            for (uint16_t i = 0; i < words; i++) {
+                dma_generation_chunk.words[words_written++] = __builtin_bswap32(frame_words[i]);
+            }
+            // Safely pack any leftover bytes into the final 32-bit word
+            if (len % 4 != 0) {
+                uint32_t word = 0;
+                int shift = 24;
+                for (uint16_t i = words * 4; i < len; i++) {
+                    word |= (uint32_t)pf_data[i] << shift;
+                    shift -= 8;
+                }
                 dma_generation_chunk.words[words_written++] = word;
             }
         } else {
             if (conv_rate == 0 && tx_accum_bits == 0) {
-                for (uint16_t i = 0; i < FRAME_SIZE; i += 2) {
-                    uint32_t word = 0;
-                    for (int b = 0; b < 2; b++) {
-                        uint8_t current_byte = current_tx_frame[i + b];
-                        
-                        uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
-                        conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
-                        
-                        word = (word << 16) | out_word;
-                    }
-                    dma_generation_chunk.words[words_written++] = word;
+                uint8_t shift_reg = conv_shift_reg; // Cache state locally to prevent RAM ping-pong
+                uint32_t* frame_ptr32 = (uint32_t*)current_tx_pf.data;
+                
+                for (uint16_t i = 0; i < words; i++) {
+                    uint32_t quad_byte = frame_ptr32[i]; // Read 4 bytes at once
+                    
+                    uint8_t cb0 = quad_byte & 0xFF;
+                    uint16_t out0 = CCSDS_CONV_FAST_LUT.byte_out[cb0] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[cb0];
+
+                    uint8_t cb1 = (quad_byte >> 8) & 0xFF;
+                    uint16_t out1 = CCSDS_CONV_FAST_LUT.byte_out[cb1] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[cb1];
+                    dma_generation_chunk.words[words_written++] = ((uint32_t)out0 << 16) | out1;
+
+                    uint8_t cb2 = (quad_byte >> 16) & 0xFF;
+                    uint16_t out2 = CCSDS_CONV_FAST_LUT.byte_out[cb2] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[cb2];
+
+                    uint8_t cb3 = (quad_byte >> 24) & 0xFF;
+                    uint16_t out3 = CCSDS_CONV_FAST_LUT.byte_out[cb3] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[cb3];
+                    dma_generation_chunk.words[words_written++] = ((uint32_t)out2 << 16) | out3;
                 }
+
+                // Automatically handle 1-3 byte remainders (e.g., resulting from I=1 interleaved frames)
+                for (uint16_t i = words * 4; i < len; i++) {
+                    uint8_t cb = pf_data[i];
+                    uint16_t out = CCSDS_CONV_FAST_LUT.byte_out[cb] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[cb];
+                    
+                    tx_accum_data = (tx_accum_data << 16) | out;
+                    tx_accum_bits += 16;
+                    if (tx_accum_bits == 32) {
+                        dma_generation_chunk.words[words_written++] = tx_accum_data;
+                        tx_accum_bits = 0;
+                    }
+                }
+                conv_shift_reg = shift_reg;
             } else {
                 uint32_t accum_data = tx_accum_data;
                 uint8_t accum_bits = tx_accum_bits;
@@ -683,15 +746,53 @@ public:
                 uint8_t p_period = PUNC_PERIOD[conv_rate];
                 uint8_t c1_mask = PUNC_C1[conv_rate];
                 uint8_t c2_mask = PUNC_C2[conv_rate];
+                uint8_t shift_reg = conv_shift_reg; // Cache state locally
 
-                for (uint16_t i = 0; i < FRAME_SIZE; i++) {
-                    uint8_t current_byte = current_tx_frame[i];
-                    uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
-                    conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
+                uint32_t* frame_ptr32 = (uint32_t*)current_tx_pf.data;
 
-                    for (int b = 7; b >= 0; b--) {
-                        uint8_t c1 = (out_word >> (b * 2 + 1)) & 1;
-                        uint8_t c2 = (out_word >> (b * 2)) & 1;
+                for (uint16_t i = 0; i < words; i++) {
+                    uint32_t quad_byte = frame_ptr32[i]; // Read 4 bytes at once
+                    
+                    for (int q = 0; q < 4; q++) {
+                        uint8_t current_byte = (quad_byte >> (q * 8)) & 0xFF;
+                        uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                        shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
+
+                        for (int b = 14; b >= 0; b -= 2) { // Unroll arithmetic
+                            uint8_t c1 = (out_word >> (b + 1)) & 1;
+                            uint8_t c2 = (out_word >> b) & 1;
+
+                            if ((c1_mask >> p_phase) & 1) {
+                                accum_data = (accum_data << 1) | c1;
+                                accum_bits++;
+                                if (accum_bits == 32) {
+                                    dma_generation_chunk.words[words_written++] = accum_data;
+                                    accum_bits = 0;
+                                }
+                            }
+                            if ((c2_mask >> p_phase) & 1) {
+                                accum_data = (accum_data << 1) | c2;
+                                accum_bits++;
+                                if (accum_bits == 32) {
+                                    dma_generation_chunk.words[words_written++] = accum_data;
+                                    accum_bits = 0;
+                                }
+                            }
+                            p_phase++;
+                            if (p_phase == p_period) p_phase = 0;
+                        }
+                    }
+                }
+
+                // Remainder logic for generalized puncturing
+                for (uint16_t i = words * 4; i < len; i++) {
+                    uint8_t current_byte = pf_data[i];
+                    uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[shift_reg];
+                    shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
+
+                    for (int b = 14; b >= 0; b -= 2) {
+                        uint8_t c1 = (out_word >> (b + 1)) & 1;
+                        uint8_t c2 = (out_word >> b) & 1;
 
                         if ((c1_mask >> p_phase) & 1) {
                             accum_data = (accum_data << 1) | c1;
@@ -699,7 +800,6 @@ public:
                             if (accum_bits == 32) {
                                 dma_generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
-                                accum_data = 0;
                             }
                         }
                         if ((c2_mask >> p_phase) & 1) {
@@ -708,16 +808,16 @@ public:
                             if (accum_bits == 32) {
                                 dma_generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
-                                accum_data = 0;
                             }
                         }
                         p_phase++;
-                        if (p_phase >= p_period) p_phase = 0;
+                        if (p_phase == p_period) p_phase = 0;
                     }
                 }
                 tx_accum_data = accum_data;
                 tx_accum_bits = accum_bits;
                 punc_phase = p_phase;
+                conv_shift_reg = shift_reg;
             }
         }
         dma_generation_chunk.length = words_written;
@@ -727,13 +827,14 @@ public:
 
     uint32_t fill_dma_buffer(uint32_t *out_buf) {
         uint32_t total_words = 0;
-        // Batch pull up to DMA_BUFFER_MULTIPLIER chunks to give Core 0 massive breathing room
-        while (total_words + (FRAME_SIZE / 2) <= (FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER) {
-            if (queue_try_remove(&dma_chunk_queue, &dma_irq_chunk)) {
-                if (dma_irq_chunk.length > 0) {
-                    memcpy(out_buf + total_words, dma_irq_chunk.words, dma_irq_chunk.length * 4);
-                    total_words += dma_irq_chunk.length;
+        while (total_words < DMA_BUFFER_TOTAL_WORDS) {
+            if (queue_try_peek(&dma_chunk_queue, &dma_irq_chunk)) {
+                if (total_words + dma_irq_chunk.length > DMA_BUFFER_TOTAL_WORDS) {
+                    break; // Doesn't fit cleanly in this DMA buffer boundary, wait for next IRQ
                 }
+                queue_try_remove(&dma_chunk_queue, &dma_irq_chunk);
+                memcpy(out_buf + total_words, dma_irq_chunk.words, dma_irq_chunk.length * 4);
+                total_words += dma_irq_chunk.length;
             } else {
                 break; // Queue is empty, stop batching
             }

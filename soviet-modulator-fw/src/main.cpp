@@ -11,6 +11,13 @@
 #define SI5351_SDA_PIN 16
 #define SI5351_SCL_PIN 17
 
+// Expose ARM GCC Linker symbols to calculate exact stack boundaries
+extern "C" char __StackLimit;
+extern "C" char __StackTop;
+extern "C" char __StackOneBottom;
+extern "C" char __StackOneTop;
+
+static volatile uint32_t core1_min_free_stack = 0xFFFFFFFF;
 static constexpr uint64_t LO_FREQUENCY_HZ = 144500000ULL;
 static constexpr uint64_t LO_FREQUENCY_01HZ = LO_FREQUENCY_HZ * SI5351_FREQ_MULT;
 
@@ -37,13 +44,13 @@ static uint8_t binary_len_buf[2];
 static uint8_t binary_len_idx = 0;
 static uint16_t binary_expected_len = 0;
 static uint16_t binary_received_len = 0;
-alignas(4) static uint8_t binary_payload_buf[FRAME_SIZE];
+alignas(4) static uint8_t binary_payload_buf[MAX_FRAME_SIZE];
 static uint16_t binary_pending_chunk_len = 0;
 static bool binary_pending_chunk_prepacked_asm = false;
-alignas(4) static uint8_t binary_pending_chunk_buf[FRAME_SIZE];
+alignas(4) static uint8_t binary_pending_chunk_buf[MAX_FRAME_SIZE];
 
 struct BinaryQueueItem {
-    alignas(4) uint8_t data[FRAME_SIZE];
+    alignas(4) uint8_t data[MAX_FRAME_SIZE];
     uint16_t len;
     bool prepacked_asm;
 };
@@ -73,9 +80,9 @@ static unsigned long current_frame_period_ms() {
 			case 3: code_rate = 5.0/6.0; break;
 			case 4: code_rate = 7.0/8.0; break;
 		}
-		output_symbols_per_frame = (uint32_t)((FRAME_SIZE * 8.0) / code_rate);
+		output_symbols_per_frame = (uint32_t)((modulator->get_frame_size() * 8.0) / code_rate);
 	} else {
-		output_symbols_per_frame = FRAME_SIZE * 8U;
+		output_symbols_per_frame = modulator->get_frame_size() * 8U;
 	}
 
 	uint32_t period_ms = (output_symbols_per_frame * 1000U + rate - 1U) / rate;
@@ -153,7 +160,7 @@ static void process_binary_upload_byte(uint8_t b) {
 			return;
 		}
 
-		uint16_t binary_chunk_max = binary_upload_prepacked_asm ? FRAME_SIZE : (FRAME_SIZE - CADU_ASM_SIZE);
+		uint16_t binary_chunk_max = binary_upload_prepacked_asm ? modulator->get_frame_size() : modulator->get_payload_size();
 		if (binary_expected_len > binary_chunk_max) {
 			binary_upload_mode = false;
 			binary_upload_finishing = false;
@@ -178,7 +185,8 @@ Command summary:
   c - Toggle CCSDS convolutional encoding
 	n - Toggle CCSDS randomizer
 	d - Toggle CCSDS dual basis conversion
-	y - Toggle Reed-Solomon (255,223) I=4 encoding
+	y - Toggle Reed-Solomon (255,223) encoding
+	l <depth> - Set RS interleaving depth (1, 2, 4, 8, 16)
 	q - Print upload/FIFO status
   t <data> - Transmit message (ASCII text)
   x - Reinitialize Si5351 LO to 51 MHz
@@ -237,7 +245,8 @@ void print_help() {
 	Serial.println("  d - Toggle CCSDS dual basis conversion");
 	Serial.println("  q - Print upload/FIFO status");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
-	Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
+	Serial.println("  y - Toggle Reed-Solomon (255,223) encoding");
+	Serial.println("  l <depth> - Set RS interleaving depth (1, 2, 4, 8, 16)");
 	Serial.println("  u - Binary upload mode (mode byte, len16 + data, len=0 ends)");
 	Serial.println("  x - Reinitialize Si5351 LO to 51 MHz");
 	Serial.println("  m - Restart whole microcontroller");
@@ -294,12 +303,17 @@ void process_input(char mode, const char* data) {
 			case 3: Serial.println("5/6"); break;
 			case 4: Serial.println("7/8"); break;
 		}
+  	} else if (mode == 'l') {
+		uint8_t depth = atoi(data);
+		if (modulator != nullptr) modulator->set_rs_interleave(depth);
+		Serial.print("RS interleaving depth set to: ");
+		Serial.println(modulator->get_rs_interleave());
   	} else if (mode == 't') {
 		uint16_t len = strlen(data);
-		if (len > MSG_BUFFER_SIZE) len = MSG_BUFFER_SIZE;
+		if (len > MAX_MSG_BUFFER_SIZE) len = MAX_MSG_BUFFER_SIZE;
 	
 		if (len > 0) {
-		  	uint8_t msg[MSG_BUFFER_SIZE];
+		  	uint8_t msg[MAX_MSG_BUFFER_SIZE];
 	  		for (uint16_t i = 0; i < len; i++) {
 				msg[i] = (uint8_t)data[i];
 	  		}
@@ -321,6 +335,12 @@ void setup1() {
 
 void loop1() {
 	if (modulator == nullptr) return;
+
+	// Track the "High Water Mark" of Core 1's stack (the lowest the free space ever gets)
+	uint32_t core1_sp;
+	asm volatile("mov %0, sp" : "=r"(core1_sp));
+	uint32_t current_free = core1_sp - (uint32_t)&__StackOneBottom;
+	if (current_free < core1_min_free_stack) core1_min_free_stack = current_free;
 	
 	// Yield completely to Core 0 if settings are actively being changed
 	if (modulator->config_lock) return;
@@ -568,10 +588,17 @@ void loop() {
 					Serial.println(modulator->get_dual_basis_enabled() ? "ON" : "OFF");
 					break;
 				}
+				case 'l': {
+					Serial.println("Enter RS interleaving depth (1, 2, 4, 8, 16):");
+					waiting_for_input = true;
+					input_mode = 'l';
+					input_idx = 0;
+					break;
+				}
 				case 'y': {
 					bool current = modulator->get_reed_solomon_enabled();
 					modulator->set_reed_solomon_enabled(!current);
-					Serial.print("Reed-Solomon (255,223) I=4: ");
+					Serial.print("Reed-Solomon (255,223): ");
 					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
 					break;
 				}
@@ -585,7 +612,13 @@ void loop() {
 				case 'q': {
 					Serial.println("Modulator status:");
 					Serial.print("  RS (255,223): ");
-					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
+					if (modulator->get_reed_solomon_enabled()) {
+						Serial.print("ON (I=");
+						Serial.print(modulator->get_rs_interleave());
+						Serial.println(")");
+					} else {
+						Serial.println("OFF");
+					}
 					Serial.print("  Dual Basis: ");
 					Serial.println(modulator->get_dual_basis_enabled() ? "ON" : "OFF");
 					Serial.print("  Randomizer: ");
@@ -605,8 +638,10 @@ void loop() {
 					}
 					Serial.println();
 					Serial.print("  Expected Payload: ");
-					Serial.print(modulator->get_reed_solomon_enabled() ? 892 : 1020);
-					Serial.println(" bytes (1024 if prepacked ASM)");
+					Serial.print(modulator->get_payload_size());
+					Serial.print(" bytes (");
+					Serial.print(modulator->get_frame_size());
+					Serial.println(" if prepacked ASM)");
 					Serial.println("Upload/FIFO status:");
 					Serial.print("  queue depth: ");
 					Serial.print(get_binary_queue_count());
@@ -622,6 +657,19 @@ void loop() {
 					Serial.println(binary_upload_finishing ? "YES" : "NO");
 					Serial.print("  tx drain complete: ");
 					Serial.println(binary_tx_drain_complete ? "YES" : "NO");
+					
+					// Measure exact stack boundaries
+					uint32_t core0_sp;
+					asm volatile("mov %0, sp" : "=r"(core0_sp));
+					uint32_t core0_total = (uint32_t)&__StackTop - (uint32_t)&__StackLimit;
+					uint32_t core0_free = core0_sp - (uint32_t)&__StackLimit;
+					uint32_t core1_total = (uint32_t)&__StackOneTop - (uint32_t)&__StackOneBottom;
+					
+					Serial.println("Memory status:");
+					Serial.print("  Core 0 Stack Free: ");
+					Serial.print(core0_free); Serial.print(" / "); Serial.println(core0_total);
+					Serial.print("  Core 1 Stack Free (Min seen): ");
+					Serial.print(core1_min_free_stack); Serial.print(" / "); Serial.println(core1_total);
 					break;
 				}
 				case 'x': {

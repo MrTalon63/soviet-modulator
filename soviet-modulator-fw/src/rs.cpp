@@ -1,4 +1,5 @@
 #include "rs.h"
+#include <cstring>
 
 // A compact Reed-Solomon (255, 223) implementation for CCSDS.
 // Based on a public domain implementation.
@@ -8,7 +9,9 @@ static uint8_t gf_log[256];
 static uint8_t rs_generator_poly[33];
 static int rs_generator_poly_log[33];
 
-// Removed const to force this LUT into RAM for faster execution
+// Precomputed feedback multiplier LUT forced to 32-bit words for extreme register optimization
+static uint32_t rs_feedback_lut32[256][8];
+
 static uint8_t dual_basis_lut[256] = {
     0x00, 0x7b, 0xaf, 0xd4, 0x99, 0xe2, 0x36, 0x4d, 0xfa, 0x81, 0x55, 0x2e, 0x63, 0x18, 0xcc, 0xb7,
     0x86, 0xfd, 0x29, 0x52, 0x1f, 0x64, 0xb0, 0xcb, 0x7c, 0x07, 0xd3, 0xa8, 0xe5, 0x9e, 0x4a, 0x31,
@@ -33,6 +36,7 @@ static uint8_t gf_mul(uint8_t a, uint8_t b) {
     return gf_exp[(int)gf_log[a] + (int)gf_log[b]];
 }
 
+// cppcheck-suppress unusedFunction
 void rs_init() {
     // Generate GF(2^8) log and anti-log tables
     // CCSDS Field Polynomial: F(x) = x^8 + x^7 + x^2 + x + 1 -> 0x187
@@ -77,44 +81,76 @@ void rs_init() {
     for (int i = 0; i <= 32; i++) {
         rs_generator_poly_log[i] = (rs_generator_poly[i] == 0) ? -1 : gf_log[rs_generator_poly[i]];
     }
+
+    // Precompute the entire 8 KB feedback multiplication table to eliminate branches and math in the encoder
+    for (int fb = 0; fb < 256; fb++) {
+        uint8_t temp_row[32];
+        if (fb == 0) {
+            for (int j = 0; j < 32; j++) temp_row[j] = 0;
+        } else {
+            int log_fb = gf_log[fb];
+            for (int j = 0; j < 32; j++) {
+                int poly_log = rs_generator_poly_log[31 - j];
+                temp_row[j] = (poly_log != -1) ? gf_exp[poly_log + log_fb] : 0;
+            }
+        }
+        memcpy(rs_feedback_lut32[fb], temp_row, 32);
+    }
 }
 
-void rs_encode(uint8_t* msg, uint8_t* parity) {
+void rs_encode(const uint8_t* msg_base, uint8_t* parity, int offset, int stride) {
     const int K = 223;
-    const int PARITY_LEN = 32;
 
-    for (int i = 0; i < PARITY_LEN; i++) {
-        parity[i] = 0;
-    }
+    // Keep the entire 32-byte parity buffer strictly inside the CPU's high-speed hardware registers
+    uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0, w4 = 0, w5 = 0, w6 = 0, w7 = 0;
+    const uint8_t* msg_ptr = msg_base + offset;
 
     for (int i = 0; i < K; i++) {
-        uint8_t feedback = msg[i] ^ parity[0];
-        if (feedback != 0) {
-            int log_feedback = gf_log[feedback];
-            for (int j = 0; j < PARITY_LEN - 1; j++) {
-                parity[j] = parity[j + 1];
-                int poly_log = rs_generator_poly_log[31 - j];
-                if (poly_log != -1) {
-                    parity[j] ^= gf_exp[poly_log + log_feedback];
-                }
-            }
-            int poly_log_0 = rs_generator_poly_log[0];
-            if (poly_log_0 != -1) {
-                parity[PARITY_LEN - 1] = gf_exp[poly_log_0 + log_feedback];
-            } else {
-                parity[PARITY_LEN - 1] = 0;
-            }
-        } else {
-            for (int j = 0; j < PARITY_LEN - 1; j++) {
-                parity[j] = parity[j + 1];
-            }
-            parity[PARITY_LEN - 1] = 0;
-        }
+        // LSB of w0 is parity[0] in little-endian
+        uint8_t feedback = (*msg_ptr) ^ (uint8_t)(w0 & 0xFF);
+        msg_ptr += stride; // Instantly jump to the next interleaved byte
+        const uint32_t* lut_row = rs_feedback_lut32[feedback];
+
+        // Shift the 32-byte register array down by 1 byte via little-endian bitwise math
+        uint32_t next_w0 = (w0 >> 8) | (w1 << 24);
+        uint32_t next_w1 = (w1 >> 8) | (w2 << 24);
+        uint32_t next_w2 = (w2 >> 8) | (w3 << 24);
+        uint32_t next_w3 = (w3 >> 8) | (w4 << 24);
+        uint32_t next_w4 = (w4 >> 8) | (w5 << 24);
+        uint32_t next_w5 = (w5 >> 8) | (w6 << 24);
+        uint32_t next_w6 = (w6 >> 8) | (w7 << 24);
+        uint32_t next_w7 = (w7 >> 8);
+
+        // XOR with the precomputed Galois field multiplication row
+        w0 = next_w0 ^ lut_row[0];
+        w1 = next_w1 ^ lut_row[1];
+        w2 = next_w2 ^ lut_row[2];
+        w3 = next_w3 ^ lut_row[3];
+        w4 = next_w4 ^ lut_row[4];
+        w5 = next_w5 ^ lut_row[5];
+        w6 = next_w6 ^ lut_row[6];
+        w7 = next_w7 ^ lut_row[7];
     }
+
+    // Safely dump the CPU registers back to the output RAM buffer using an aligned block copy
+    uint32_t final_w[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    memcpy(parity, final_w, 32);
 }
 
 void rs_apply_dual_basis(uint8_t* data, int len) {
-    for (int i = 0; i < len; i++) {
+    int len32 = len / 4;
+    
+    for (int i = 0; i < len32; i++) {
+        uint32_t word;
+        memcpy(&word, &data[i * 4], 4); // Protects against unaligned traps and strict-aliasing faults
+        word = (dual_basis_lut[word & 0xFF]) |
+               (dual_basis_lut[(word >> 8) & 0xFF] << 8) |
+               (dual_basis_lut[(word >> 16) & 0xFF] << 16) |
+               (dual_basis_lut[(word >> 24) & 0xFF] << 24);
+        memcpy(&data[i * 4], &word, 4);
+    }
+    
+    for (int i = len32 * 4; i < len; i++) {
         data[i] = dual_basis_lut[data[i]];
     }
 }
