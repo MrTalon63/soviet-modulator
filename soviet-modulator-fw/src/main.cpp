@@ -126,6 +126,7 @@ static bool try_enqueue_pending_chunk() {
 	binary_tx_drain_complete = false;
 	binary_upload_chunk_pending_enqueue = false;
 	binary_pending_chunk_len = 0;
+	last_binary_rx_ms = millis();
 	binary_expected_len = 0;
 	binary_received_len = 0;
 	Serial.write('K'); // Acknowledge successful enqueue to perfectly pace the Python script
@@ -343,11 +344,13 @@ void loop1() {
 	if (current_free < core1_min_free_stack) core1_min_free_stack = current_free;
 	
 	// Yield completely to Core 0 if settings are actively being changed
+	__dmb(); // Ensure we see the latest config_lock state from Core 0
 	if (modulator->config_lock) return;
 
 	// Drain as many incoming USB chunks as physically possible to maximize payload speed
 	static BinaryQueueItem item;
 	while (get_binary_queue_count() > 0 && modulator->can_queue_binary_frame()) {
+		__dmb();
 		if (modulator->config_lock) break;
 		if (queue_try_remove(&binary_queue, &item)) {
 			modulator->queue_binary_frame(item.data, item.len, item.prepacked_asm);
@@ -355,7 +358,7 @@ void loop1() {
 		}
 	}
 
-	if (request_fec_flush && get_binary_queue_count() == 0) {
+	if (request_fec_flush && get_binary_queue_count() == 0 && !modulator->config_lock) {
 		if (!modulator->config_lock && modulator->can_queue_binary_frame()) { 
 			modulator->flush_fec_buffer();
 			request_fec_flush = false;
@@ -363,8 +366,11 @@ void loop1() {
 	}
 
 	// Drain baseband queue into DMA chunk queue
-	while (!modulator->config_lock) {
+	while (true) {
+		__dmb();
+		if (modulator->config_lock) break;
 		if (!modulator->process_baseband_to_dma()) break; // Break when DMA queue hits 14 chunks
+		delayMicroseconds(50); // Prevent Core 1 from starving the system bus
 	}
 
 	if (modulator->has_pending_message()) {
@@ -394,7 +400,7 @@ void loop() {
 	}
 
 	if (binary_upload_finishing) {
-		if (get_binary_queue_count() == 0 && modulator->get_pending_frames_count() == 0 && !request_fec_flush) {
+		if (get_binary_queue_count() == 0 && modulator->get_pending_frames_count() == 0 && modulator->get_dma_chunks_count() == 0 && !request_fec_flush) {
 			if (binary_finish_started_ms == 0) {
 				binary_finish_started_ms = now;
 			} else if (now - binary_finish_started_ms >= current_frame_period_ms()) {
@@ -408,9 +414,11 @@ void loop() {
 		}
 	}
 
-	// Safety Timeout: If Python crashes or drops, automatically escape Binary Mode after 1 second of silence
+	// Safety Timeout: If Python crashes or drops, automatically escape Binary Mode after 5 minutes of silence.
+	// This must be significantly longer than the time it takes to transmit one DMA block at 
+	// the slowest supported symbol rate (e.g., 1200 baud).
 	if ((binary_upload_mode || binary_error_sink_mode) && !Serial.available()) {
-		if (now - last_binary_rx_ms > 1000) {
+		if (now - last_binary_rx_ms > 300000) {
 			binary_upload_mode = false;
 			binary_upload_finishing = false;
 			binary_upload_chunk_pending_enqueue = false;
@@ -428,14 +436,14 @@ void loop() {
 			return;
 		}
 
-		if (binary_upload_mode) {
-			last_binary_rx_ms = now; // Reset the timeout watchdog
+		if (binary_upload_mode && Serial.available()) {
 			while (binary_upload_mode && Serial.available()) {
 				if (binary_upload_chunk_pending_enqueue) {
 					break; // Queue full, stop pulling bytes from Serial buffer to prevent dropping
 				}
 				
 				if (binary_expected_len > 0) {
+					last_binary_rx_ms = now; // Only reset watchdog when we actually pull data
 					size_t to_read = binary_expected_len - binary_received_len;
 					size_t avail = Serial.available();
 					if (avail < to_read) to_read = avail;
@@ -452,6 +460,7 @@ void loop() {
 						binary_upload_chunk_pending_enqueue = true;
 						
 						if (!try_enqueue_pending_chunk()) {
+							yield(); // Let system tasks run while waiting for queue space
 							break; // Queue actually full, yield execution to system
 						}
 						
@@ -548,14 +557,13 @@ void loop() {
 				}
 				case 'f': {
 					filler_enabled = !filler_enabled;
+					modulator->set_filler_enabled(filler_enabled);
 					if (filler_enabled) {
 						modulator->lock_config();
 						modulator->init_frame();
 						modulator->unlock_config();
-						modulator->restart_transmission();
 						Serial.println("Filler transmission enabled");
 					} else {
-						modulator->clear_frame();
 						Serial.println("Filler transmission disabled");
 					}
 					break;

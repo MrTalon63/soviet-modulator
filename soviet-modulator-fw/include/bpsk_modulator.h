@@ -1,4 +1,4 @@
-﻿#ifndef BPSK_MODULATOR_H
+#ifndef BPSK_MODULATOR_H
 #define BPSK_MODULATOR_H
 
 #include <Arduino.h>
@@ -135,8 +135,8 @@ private:
     dma_channel_config c0;
     dma_channel_config c1;
     
-    static constexpr int DMA_BUFFER_TOTAL_WORDS = 4096;
-    uint32_t dma_buf[2][DMA_BUFFER_TOTAL_WORDS];
+    static constexpr int DMA_BUFFER_MULTIPLIER = 2;
+    uint32_t dma_buf[2][(FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER];
     
     uint pin;
     uint32_t symbolrate_hz;
@@ -145,6 +145,7 @@ private:
     volatile bool running;
     volatile bool restore_filler_after_message;
     bool convolution_enabled;
+    bool filler_enabled;
     bool randomizer_enabled;
     bool reed_solomon_enabled;
     bool dual_basis_enabled;
@@ -169,9 +170,7 @@ private:
         uint32_t length; // 32-bit perfectly aligns struct for ARM LDM/STM memory copies
     };
 
-    alignas(4) PendingFrame current_tx_pf;
-    alignas(4) PendingFrame staging_pf;
-    alignas(4) DmaChunk dma_generation_chunk;
+    alignas(4) uint8_t current_tx_frame[FRAME_SIZE];
     alignas(4) DmaChunk dma_irq_chunk;
     alignas(4) uint8_t rs_cadu_buffer[MAX_FRAME_SIZE];
 
@@ -195,10 +194,6 @@ private:
         while (queue_try_remove(&pending_frame_queue, &dummy));
     }
 
-    uint8_t get_dma_chunks_count() const {
-        return queue_get_level(const_cast<queue_t*>(&dma_chunk_queue));
-    }
-
     void clear_baseband_state() {
         conv_shift_reg = 0;
         tx_accum_data = 0;
@@ -220,6 +215,10 @@ public:
         delay(2); // Wait 2ms to ensure Core 1 cleanly exits its baseband processing loop
     }
 
+    uint8_t get_dma_chunks_count() const {
+        return queue_get_level(const_cast<queue_t*>(&dma_chunk_queue));
+    }
+
     void unlock_config() {
         __dmb();
         config_lock = false;
@@ -228,8 +227,7 @@ public:
     
     BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), 
           msg_len(0), msg_pending(false), running(false), restore_filler_after_message(false),
-                    convolution_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
-                    rs_interleave(4), current_frame_size(CADU_ASM_SIZE + (255 * 4)), current_payload_size(223 * 4),
+                    convolution_enabled(true), filler_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
                     fec_input_buffer_len(0),
                     conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
                     config_lock(false) {
@@ -476,6 +474,10 @@ public:
 
     bool get_convolutional_encoding() const { return convolution_enabled; }
 
+    void set_filler_enabled(bool enabled) {
+        filler_enabled = enabled;
+    }
+
     void set_conv_rate(uint8_t rate) {
         if (rate > 4) rate = 4;
         if (conv_rate == rate) return; // Do not interrupt running stream if unchanged!
@@ -673,30 +675,23 @@ public:
             if (get_dma_chunks_count() > 28) {
                 return false; // Queue is healthy, don't spam filler frames. Yield to let feed_modulator run.
             }
+            if (!filler_enabled) return false; // Pipeline pause if filler is disabled and no data
             // Always copy to the local buffer to ensure consistent memory access patterns
             memcpy(current_tx_pf.data, filler_frame, current_frame_size);
             current_tx_pf.length = current_frame_size;
         }
 
+        DmaChunk generation_chunk; // Use stack to prevent Core 0/1 member collisions
         uint32_t words_written = 0;
         uint16_t len = current_tx_pf.length;
         uint16_t words = len / 4;
         uint8_t* pf_data = (uint8_t*)current_tx_pf.data;
 
         if (!convolution_enabled) {
-            uint32_t* frame_words = (uint32_t*)current_tx_pf.data;
-            for (uint16_t i = 0; i < words; i++) {
-                dma_generation_chunk.words[words_written++] = __builtin_bswap32(frame_words[i]);
-            }
-            // Safely pack any leftover bytes into the final 32-bit word
-            if (len % 4 != 0) {
-                uint32_t word = 0;
-                int shift = 24;
-                for (uint16_t i = words * 4; i < len; i++) {
-                    word |= (uint32_t)pf_data[i] << shift;
-                    shift -= 8;
-                }
-                dma_generation_chunk.words[words_written++] = word;
+            uint32_t* frame_words = (uint32_t*)current_tx_frame;
+            for (uint16_t i = 0; i < FRAME_SIZE / 4; i++) {
+                uint32_t word = __builtin_bswap32(frame_words[i]);
+                generation_chunk.words[words_written++] = word;
             }
         } else {
             if (conv_rate == 0 && tx_accum_bits == 0) {
@@ -737,6 +732,7 @@ public:
                         dma_generation_chunk.words[words_written++] = tx_accum_data;
                         tx_accum_bits = 0;
                     }
+                    generation_chunk.words[words_written++] = word;
                 }
                 conv_shift_reg = shift_reg;
             } else {
@@ -798,7 +794,7 @@ public:
                             accum_data = (accum_data << 1) | c1;
                             accum_bits++;
                             if (accum_bits == 32) {
-                                dma_generation_chunk.words[words_written++] = accum_data;
+                                generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
                             }
                         }
@@ -806,7 +802,7 @@ public:
                             accum_data = (accum_data << 1) | c2;
                             accum_bits++;
                             if (accum_bits == 32) {
-                                dma_generation_chunk.words[words_written++] = accum_data;
+                                generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
                             }
                         }
@@ -820,8 +816,8 @@ public:
                 conv_shift_reg = shift_reg;
             }
         }
-        dma_generation_chunk.length = words_written;
-        queue_try_add(&dma_chunk_queue, &dma_generation_chunk);
+        generation_chunk.length = words_written;
+        queue_try_add(&dma_chunk_queue, &generation_chunk);
         return true;
     }
 
@@ -923,10 +919,10 @@ public:
     void start() {
         if (running) return;
 
-        pio_gpio_init(pio, pin);
-        pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+        flush_dma_chunks();
         pio_sm_clear_fifos(pio, sm);
         pio_sm_restart(pio, sm);
+        pio_sm_set_enabled(pio, sm, false);
 
         // Pre-fill DMA queue with 2 chunks directly on Core 0 to prevent cross-core deadlocks
         while (get_dma_chunks_count() < 2) {
@@ -942,10 +938,13 @@ public:
 
         dma_channel_set_irq0_enabled(dma_chan_0, true);
         dma_channel_set_irq0_enabled(dma_chan_1, true);
-
+        
         running = true; // MUST be true before starting DMA so the ISR doesn't reject the very first interrupt
+        __dmb(); // Ensure running state is visible to the ISR before it can be triggered
+        
         dma_channel_start(dma_chan_0);
         pio_sm_set_enabled(pio, sm, true);
+        pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
     }
 
     void stop() {
