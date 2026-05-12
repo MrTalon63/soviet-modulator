@@ -16,7 +16,6 @@ static constexpr uint64_t LO_FREQUENCY_01HZ = LO_FREQUENCY_HZ * SI5351_FREQ_MULT
 
 static BPSKModulator* modulator = nullptr;
 static Si5351 si5351;
-static bool filler_enabled = true;
 static unsigned long frame_start = 0;
 static unsigned long last_blink = 0;
 static bool led_state = false;
@@ -154,7 +153,7 @@ static void process_binary_upload_byte(uint8_t b) {
 			return;
 		}
 
-		uint16_t binary_chunk_max = binary_upload_prepacked_asm ? FRAME_SIZE : (FRAME_SIZE - CADU_ASM_SIZE);
+		uint16_t binary_chunk_max = binary_upload_prepacked_asm ? FRAME_SIZE : (FRAME_SIZE - PAYLOAD_OFFSET);
 		if (binary_expected_len > binary_chunk_max) {
 			binary_upload_mode = false;
 			binary_upload_finishing = false;
@@ -231,7 +230,6 @@ void print_help() {
 	Serial.println("  s - Start modulation");
 	Serial.println("  p - Stop modulation");
 	Serial.println("  i - Print current rate");
-	Serial.println("  f - Toggle filler transmission");
 	Serial.println("  c - Toggle CCSDS convolutional encoding");
 	Serial.println("  k <rate> - Set convolutional puncturing rate (0=1/2, 1=2/3, 2=3/4, 3=5/6, 4=7/8)");
 	Serial.println("  n - Toggle CCSDS randomizer");
@@ -241,6 +239,9 @@ void print_help() {
 	Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
 	Serial.println("  u - Binary upload mode (mode byte, len16 + data, len=0 ends)");
 	Serial.println("  x - Reinitialize Si5351 LO to 51 MHz");
+	Serial.println("  o - Queue OID (Operational Idle Data) frame (VCID=0x3F)");
+	Serial.println("  I <vcid> - Queue idle data MPDU frame with specified VCID (0-63)");
+	Serial.println("  O - Output OID pattern (first 10 bytes) for verification");
 	Serial.println("  m - Restart whole microcontroller");
 	Serial.println("  h - Print this help menu");
 }
@@ -257,7 +258,7 @@ void setup() {
 	digitalWrite(23, HIGH); // Set pin 23 high so DC/DC isn't fucking shitfest
 	
 	Serial.begin(921600);
-	rs_init(); // Initialize Reed-Solomon tables BEFORE the modulator generates its filler frame!
+	rs_init(); // Initialize Reed-Solomon tables BEFORE the modulator generates its OID frame!
 	
 	modulator = new BPSKModulator(MODULATING_PIN, 500000);
 	if (modulator == nullptr) {
@@ -309,7 +310,16 @@ void process_input(char mode, const char* data) {
 	  		Serial.print(len);
 	  		Serial.println(" bytes");
 		}
-  	}
+  	} else if (mode == 'I') {
+		uint8_t vcid = atoi(data);
+		if (vcid > 63) {
+			Serial.println("ERROR: VCID must be 0-63");
+		} else {
+			if (modulator != nullptr) modulator->queue_idle_data_frame(vcid);
+			Serial.print("Idle data frame queued with VCID=");
+			Serial.println(vcid);
+		}
+	}
 }
 
 // setup1() and loop1() natively execute on Core 1 in Arduino-Pico
@@ -356,7 +366,7 @@ void loop1() {
 	if (modulator->has_pending_message()) {
 		unsigned long now = millis();
 		if (now - frame_start >= current_frame_period_ms()) {
-			modulator->inject_message(filler_enabled);
+			modulator->inject_message();
 			frame_start = now;
 		}
 	}
@@ -535,19 +545,6 @@ void loop() {
 					Serial.println(" Hz");
 					break;
 				}
-				case 'f': {
-					filler_enabled = !filler_enabled;
-					modulator->set_filler_enabled(filler_enabled);
-					if (filler_enabled) {
-						modulator->lock_config();
-						modulator->init_frame();
-						modulator->unlock_config();
-						Serial.println("Filler transmission enabled");
-					} else {
-						Serial.println("Filler transmission disabled");
-					}
-					break;
-				}
 				case 'c': {
 					bool current = modulator->get_convolutional_encoding();
 					modulator->set_convolutional_encoding(!current);
@@ -639,6 +636,34 @@ void loop() {
 				}
 				case 'm': {
 					reboot_microcontroller();
+					break;
+				}
+				case 'O': {
+					// Output first 10 bytes of OID frame for verification
+					Serial.println("OID pattern (first 10 bytes):");
+					uint8_t* oid_frame = modulator->get_oid_frame();
+					for (int i = 0; i < 10; i++) {
+						Serial.print(oid_frame[i], HEX);
+						if (i < 9) Serial.print(" ");
+					}
+					Serial.println();
+					Serial.println("Expected: FF FF FF FF 6D B6 D8 61 45 1F");
+					break;
+				}
+				case 'o': {
+					// Queue an OID frame for transmission
+					if (modulator->queue_oid_frame()) {
+						Serial.println("OID frame queued");
+					} else {
+						Serial.println("ERROR: Failed to queue OID frame");
+					}
+					break;
+				}
+				case 'I': {
+					Serial.println("Enter VCID (0-63, default 0):");
+					waiting_for_input = true;
+					input_mode = 'I';
+					input_idx = 0;
 					break;
 				}
 				case 'h': {
