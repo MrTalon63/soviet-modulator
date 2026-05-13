@@ -43,7 +43,8 @@ static constexpr uint8_t MPDU_SEQ_CONTINUATION = 0x00;  // 00: Continuation of p
 static constexpr uint8_t MPDU_SEQ_END = 0x01;          // 01: End of packet
 static constexpr uint8_t MPDU_SEQ_START = 0x02;        // 10: Start of packet
 static constexpr uint8_t MPDU_SEQ_UNSEGMENTED = 0x03;  // 11: Unsegmented packet (complete packet)
-static constexpr uint16_t MPDU_NO_START_PACKET = 0x7FF;  // FHP = 2047: No packet start in this frame
+static constexpr uint16_t MPDU_NO_START_PACKET = 0xFFFF; // FHP = all ones: No packet start in this frame
+static constexpr uint16_t MPDU_IDLE_DATA = 0xFFFE;       // FHP = all ones minus one: Only Idle Data in this frame
 // CCSDS legacy 8-bit randomizer table used by SatDump.
 static constexpr uint8_t RANDOMIZER8_TABLE[255] = {
     0xff, 0x48, 0x0e, 0xc0, 0x9a, 0x0d, 0x70, 0xbc,
@@ -169,6 +170,22 @@ struct OIDFrameRandomizer {
 // Static instance - constructor runs at runtime to initialize pattern
 static OIDFrameRandomizer OID_FRAME_PATTERN;
 
+static uint16_t calculate_fecf(const uint8_t *data, uint16_t length) {
+    // CCSDS 732.0-B-5 Section 4.1.6.2: CRC-16-CCITT, Initial=0xFFFF, No final XOR
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < length; i++) {
+        crc ^= ((uint16_t)data[i] << 8);
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x8000) {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc = (crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
 static uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
 static uint8_t PUNC_C1[] = { 0b1, 0b01, 0b101, 0b10101, 0b1010001 };
 static uint8_t PUNC_C2[] = { 0b1, 0b11, 0b011, 0b01011, 0b0101111 };
@@ -211,13 +228,22 @@ private:
     bool randomizer_enabled;
     bool reed_solomon_enabled;
     bool dual_basis_enabled;
+    bool fecf_enabled;
 
-    alignas(4) uint8_t fec_input_buffer[892];
-    uint16_t fec_input_buffer_len;
+    static constexpr uint32_t SP_FIFO_SIZE = 131072; // 128 KB, MUST be power of 2
+    volatile uint8_t sp_fifo[SP_FIFO_SIZE];
+    volatile uint32_t sp_fifo_head = 0;
+    volatile uint32_t sp_fifo_tail = 0;
+
+    uint32_t current_sp_size;
+    uint32_t current_sp_offset;
+    bool is_filler;
+    uint8_t filler_header[6];
+    uint16_t filler_seq;
 
     // VCDU (Virtual Channel Data Unit) state for AOS Level 0 Transfer Frames
     uint32_t vcdu_frame_count;  // Master frame counter (20 bits), reset on transmitter restart
-    uint8_t vcdu_vcid_counters[64];  // Per-VCID counter (8 bits each) for 64 possible VCIDs
+    uint32_t vcdu_vcid_counters[64];  // Per-VCID counter (24 bits each) for 64 possible VCIDs
 
     // Deep enough to absorb math delays, small enough to prevent Out-Of-Memory crashes
     static constexpr int PENDING_FRAME_QUEUE_SIZE = 32;
@@ -226,6 +252,7 @@ private:
     struct alignas(4) DmaChunk {
         uint32_t words[FRAME_SIZE / 2];
         uint32_t length; // 32-bit perfectly aligns struct for ARM LDM/STM memory copies
+        uint32_t is_user_data; // Tag to differentiate payload chunks from auto-generated OID chunks
     };
 
     alignas(4) uint8_t current_tx_frame[FRAME_SIZE];
@@ -242,6 +269,9 @@ private:
     static constexpr int DMA_CHUNK_QUEUE_SIZE = 32;
     queue_t dma_chunk_queue;
 
+    volatile uint32_t tx_user_frames_generated = 0;
+    volatile uint32_t tx_user_chunks_dma_cleared = 0;
+
     void flush_dma_chunks() {
         static DmaChunk dummy;
         while (queue_try_remove(&dma_chunk_queue, &dummy));
@@ -257,14 +287,22 @@ private:
         tx_accum_data = 0;
         tx_accum_bits = 0;
         punc_phase = 0;
-        fec_input_buffer_len = 0;
+        
+        sp_fifo_head = 0;
+        sp_fifo_tail = 0;
+        current_sp_size = 0;
+        current_sp_offset = 0;
+        is_filler = false;
+        filler_seq = 0;
+        tx_user_frames_generated = 0;
+        tx_user_chunks_dma_cleared = 0;
+
         flush_pending_frames();
         flush_dma_chunks();
     }
 
 public:
     alignas(4) uint8_t frame[FRAME_SIZE];
-    alignas(4) uint8_t msg_buffer[MSG_BUFFER_SIZE];
     volatile bool config_lock;
     
     void lock_config() {
@@ -286,10 +324,9 @@ public:
     BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), 
           msg_len(0), msg_pending(false), running(false),
                     convolution_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
-                    fec_input_buffer_len(0),
-                    conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
+                    fecf_enabled(true), conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
                     vcdu_frame_count(0),
-                    config_lock(false) {
+                    config_lock(false), current_sp_size(0), current_sp_offset(0), is_filler(false), filler_seq(0) {
         g_modulator_instance = this;
         queue_init(&pending_frame_queue, FRAME_SIZE, PENDING_FRAME_QUEUE_SIZE);
         queue_init(&dma_chunk_queue, sizeof(DmaChunk), DMA_CHUNK_QUEUE_SIZE);
@@ -307,6 +344,46 @@ public:
         queue_free(&dma_chunk_queue);
     }
 
+    uint32_t get_sp_fifo_count() const {
+        uint32_t head = sp_fifo_head;
+        __dmb(); // Prevent speculative reads of the FIFO buffer before the head pointer is evaluated
+        return (head - sp_fifo_tail) & (SP_FIFO_SIZE - 1);
+    }
+
+    uint32_t get_sp_fifo_free() const {
+        return SP_FIFO_SIZE - 1 - get_sp_fifo_count();
+    }
+
+    bool push_sp_byte(uint8_t b) {
+        if (get_sp_fifo_free() == 0) return false;
+        sp_fifo[sp_fifo_head] = b;
+        __dmb(); // Force byte to physical RAM before head increments to prevent Core 1 from reading garbage
+        sp_fifo_head = (sp_fifo_head + 1) & (SP_FIFO_SIZE - 1);
+        return true;
+    }
+
+    uint8_t pop_sp_byte() {
+        if (get_sp_fifo_count() == 0) return 0;
+        uint8_t b = sp_fifo[sp_fifo_tail];
+        __dmb(); // Ensure read completes before advancing tail
+        sp_fifo_tail = (sp_fifo_tail + 1) & (SP_FIFO_SIZE - 1);
+        return b;
+    }
+
+    uint8_t peek_sp_byte(uint32_t offset) const {
+        return sp_fifo[(sp_fifo_tail + offset) & (SP_FIFO_SIZE - 1)];
+    }
+
+    void clear_sp_fifo() {
+        lock_config();
+        sp_fifo_head = 0;
+        sp_fifo_tail = 0;
+        current_sp_size = 0;
+        current_sp_offset = 0;
+        is_filler = false;
+        unlock_config();
+    }
+
     void prepare_tx_stream() {
         // DMA prepares chunks synchronously via ISR. Empty wrapper preserves compatibility.
     }
@@ -318,7 +395,7 @@ public:
     }
 
 
-    void build_vcdu_header(uint8_t *frame, uint16_t frame_offset, uint8_t vcid, uint32_t frame_count, uint8_t vcid_count) {
+    void build_vcdu_header(uint8_t *frame, uint16_t frame_offset, uint8_t vcid, uint32_t frame_count) {
         // Build VCDU (Virtual Channel Data Unit) Transfer Frame Header (6 bytes) per CCSDS 732.0-B-5
         // frame_offset: offset into frame buffer (typically ASM_SIZE = 4 for RS blocks)
         
@@ -340,26 +417,6 @@ public:
                    ((VCDU_SPACECRAFT_ID >> 8) & 0x03) << 4 | (VCDU_FRAME_COUNT_CYCLE & 0x0F);
     }
 
-    void build_vcdu_header(uint8_t *frame, uint8_t vcid, uint32_t frame_count, uint8_t vcid_count) {
-        // Build VCDU (Virtual Channel Data Unit) Transfer Frame Header (6 bytes)
-        // Compliant with CCSDS 732.0-B-5 AOS Level 0 Transfer Frame
-        
-        // Byte 0: TFVN (2 bits) = 01 | SCID LSB (6 bits, bits 7-2 of 10-bit SCID)
-        frame[0] = (VCDU_TRANSFER_FRAME_VERSION << 6) | ((VCDU_SPACECRAFT_ID >> 2) & 0x3F);
-        
-        // Byte 1: SCID LSB (2 bits, bits 1-0 of 10-bit SCID) | VCID (6 bits)
-        frame[1] = ((VCDU_SPACECRAFT_ID & 0x03) << 6) | (vcid & 0x3F);
-        
-        // Bytes 2-4: Frame Count (24 bits, 3 octets)
-        frame[2] = (frame_count >> 16) & 0xFF;  // Bits 23-16
-        frame[3] = (frame_count >> 8) & 0xFF;   // Bits 15-8
-        frame[4] = frame_count & 0xFF;          // Bits 7-0
-        
-        // Byte 5: Replay Flag (1 bit) | Cycle Use Flag (1 bit) | SCID MSB (2 bits, bits 9-8) | Frame Count Cycle (4 bits)
-        frame[5] = (VCDU_REPLAY_FLAG << 7) | (VCDU_CYCLE_USE_FLAG << 6) | 
-                   ((VCDU_SPACECRAFT_ID >> 8) & 0x03) << 4 | (VCDU_FRAME_COUNT_CYCLE & 0x0F);
-    }
-
     void reset_vcdu_counters() {
         vcdu_frame_count = 0;
         memset(vcdu_vcid_counters, 0, sizeof(vcdu_vcid_counters));
@@ -372,10 +429,10 @@ public:
         
         uint8_t *header = frame + frame_offset;
         
-        // MPDU Byte 0: FHP bits 0-7 (upper byte)
+        // MPDU Byte 0: FHP bits 8-15 (upper byte)
         header[0] = (first_header_ptr >> 8) & 0xFF;
         
-        // MPDU Byte 1: FHP bits 8-15 (lower byte)
+        // MPDU Byte 1: FHP bits 0-7 (lower byte)
         header[1] = first_header_ptr & 0xFF;
     }
 
@@ -400,15 +457,20 @@ public:
         
         // VCDU header at bytes 4-9 with VCID=0x3F (OID indicator)
         // Frame count and other VCDU fields set to default values
-        build_vcdu_header(oid_frame, VCDU_OFFSET, 0x3F, 0, 64);
+        build_vcdu_header(oid_frame, VCDU_OFFSET, 0x3F, 0);
         
-        // MPDU header at bytes 10-11 (16-bit FHP)
-        // FHP=0xFFFF means no packet start in this frame
-        build_mpdu_header(oid_frame, MPDU_OFFSET, 0xFFFF);
-        
-        // Fill bytes 12-1023 with OID pattern (1012 bytes of idle data)
-        for (uint16_t i = 0; i < RS_PAYLOAD_SIZE; i++) {
-            oid_frame[PAYLOAD_OFFSET + i] = OID_FRAME_PATTERN.pattern[i % 256];
+        // For OID frames (VCID 63), there is NO MPDU header!
+        // OID pattern starts immediately after the VCDU header.
+        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t oid_payload_size = length_to_crc - VCDU_HEADER_SIZE;
+        for (uint16_t i = 0; i < oid_payload_size; i++) {
+            oid_frame[ASM_SIZE + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i % 256];
+        }
+
+        if (fecf_enabled) {
+            uint16_t crc = calculate_fecf(oid_frame + ASM_SIZE, length_to_crc);
+            oid_frame[ASM_SIZE + length_to_crc] = (crc >> 8) & 0xFF;
+            oid_frame[ASM_SIZE + length_to_crc + 1] = crc & 0xFF;
         }
     }
 
@@ -424,17 +486,31 @@ public:
         frame[3] = 0x1D;
         
         // VCDU header at bytes 4-9 with specified VCID
-        build_vcdu_header(frame, VCDU_OFFSET, vcid, vcdu_frame_count, vcdu_vcid_counters[vcid]);
+        build_vcdu_header(frame, VCDU_OFFSET, vcid, vcdu_vcid_counters[vcid]);
         vcdu_vcid_counters[vcid]++;  // Increment per-VCID counter
         vcdu_frame_count++;  // Increment master frame counter
         
-        // MPDU header at bytes 10-11 (16-bit FHP)
-        // FHP=0xFFFF means no packet start in this frame
-        build_mpdu_header(frame, MPDU_OFFSET, 0xFFFF);
+        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
         
-        // Fill bytes 12-1023 with idle data pattern (1012 bytes)
-        for (uint16_t i = 0; i < RS_PAYLOAD_SIZE; i++) {
-            frame[PAYLOAD_OFFSET + i] = OID_FRAME_PATTERN.pattern[i % 256];
+        if (vcid == 0x3F) {
+            // OID Frame: No MPDU header
+            uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE;
+            for (uint16_t i = 0; i < payload_size; i++) {
+                frame[VCDU_OFFSET + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i % 256];
+            }
+        } else {
+            // MPDU Idle Frame
+            build_mpdu_header(frame, MPDU_OFFSET, MPDU_IDLE_DATA);
+            uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
+            for (uint16_t i = 0; i < payload_size; i++) {
+                frame[PAYLOAD_OFFSET + i] = OID_FRAME_PATTERN.pattern[i % 256];
+            }
+        }
+        
+        if (fecf_enabled) {
+            uint16_t crc = calculate_fecf(frame + ASM_SIZE, length_to_crc);
+            frame[ASM_SIZE + length_to_crc] = (crc >> 8) & 0xFF;
+            frame[ASM_SIZE + length_to_crc + 1] = crc & 0xFF;
         }
         
         // Apply RS encoding if enabled
@@ -486,74 +562,16 @@ public:
         }
     }
 
-    void init_frame_with_message(const uint8_t *msg, uint16_t len) {
-        // ASM at bytes 0-3
-        frame[0] = 0x1A;
-        frame[1] = 0xCF;
-        frame[2] = 0xFC;
-        frame[3] = 0x1D;
-        
-        // Build VCDU header inside RS block (bytes 4-9)
-        build_vcdu_header(frame, ASM_SIZE, VCDU_DEFAULT_VCID, vcdu_frame_count, vcdu_vcid_counters[VCDU_DEFAULT_VCID]);
-        vcdu_vcid_counters[VCDU_DEFAULT_VCID]++;  // Increment VCID counter
-        vcdu_frame_count++;  // Increment frame counter
-        
-        // Build MPDU header inside RS block (bytes 10-11) - FHP=0 (packet at start of payload)
-        build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, 0);
-        
-        uint16_t pos = PAYLOAD_OFFSET;
-        for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
-            frame[pos] = msg[i];
-        for (uint16_t i = pos; i < FRAME_SIZE; i++)
-            frame[i] = 0x55;
-        if (randomizer_enabled) {
-            for (uint16_t i = PAYLOAD_OFFSET; i < FRAME_SIZE; i++) {
-                frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - PAYLOAD_OFFSET];
-            }
-        }
-        prepare_tx_stream();
-    }
-
-    void init_frame_binary(const uint8_t *data, uint16_t len, bool prepacked_asm) {
-        memset(frame, 0x55, FRAME_SIZE);
-        if (prepacked_asm) {
-            // For prepacked frames, assume they already have ASM+VCDU+MPDU headers
-            for (uint16_t i = 0; i < len && i < FRAME_SIZE; i++)
-                frame[i] = data[i];
-        } else {
-            // ASM at bytes 0-3
-            frame[0] = 0x1A;
-            frame[1] = 0xCF;
-            frame[2] = 0xFC;
-            frame[3] = 0x1D;
-            
-            // Build VCDU header inside RS block (bytes 4-9)
-            build_vcdu_header(frame, ASM_SIZE, VCDU_DEFAULT_VCID, vcdu_frame_count, vcdu_vcid_counters[VCDU_DEFAULT_VCID]);
-            vcdu_vcid_counters[VCDU_DEFAULT_VCID]++;  // Increment VCID counter
-            vcdu_frame_count++;  // Increment frame counter
-            
-            // Build MPDU header inside RS block (bytes 10-11) - FHP=0 (packet at start of payload)
-            build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, 0);
-            
-            uint16_t pos = PAYLOAD_OFFSET;
-            for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
-                frame[pos] = data[i];
-        }
-
-        if (randomizer_enabled) {
-            for (uint16_t i = PAYLOAD_OFFSET; i < FRAME_SIZE; i++) {
-                frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - PAYLOAD_OFFSET];
-            }
-        }
-        prepare_tx_stream();
-    }
-
     uint8_t get_pending_frames_count() const {
         return queue_get_level(const_cast<queue_t*>(&pending_frame_queue));
     }
 
     bool push_pending_frame(const uint8_t* frame_data) {
-        return queue_try_add(&pending_frame_queue, frame_data);
+        if (queue_try_add(&pending_frame_queue, frame_data)) {
+            tx_user_frames_generated++; // Track all user-provided data frames
+            return true;
+        }
+        return false;
     }
 
     bool pop_pending_frame(uint8_t* frame_data) {
@@ -562,6 +580,10 @@ public:
 
     uint8_t* get_oid_frame() {
         return oid_frame;
+    }
+
+    uint32_t get_active_user_chunks() const {
+        return tx_user_frames_generated - tx_user_chunks_dma_cleared;
     }
 
     bool queue_oid_frame() {
@@ -574,91 +596,6 @@ public:
         return push_pending_frame(frame);
     }
 
-    void process_rs_buffer() {
-        static const int I = 4;
-        static const int RS_K = 223;
-        static const int RS_N = 255;
-        static const int RS_ENCODED_SIZE = I * RS_N; // 1020
-        static const int CADU_SIZE = ASM_SIZE + RS_ENCODED_SIZE; // 1024 bytes total
-
-        // ASM at bytes 0-3
-        rs_cadu_buffer[0] = 0x1A;
-        rs_cadu_buffer[1] = 0xCF;
-        rs_cadu_buffer[2] = 0xFC;
-        rs_cadu_buffer[3] = 0x1D;
-        
-        // Build VCDU header inside RS block (bytes 4-9)
-        build_vcdu_header(rs_cadu_buffer, ASM_SIZE, VCDU_DEFAULT_VCID, vcdu_frame_count, vcdu_vcid_counters[VCDU_DEFAULT_VCID]);
-        vcdu_vcid_counters[VCDU_DEFAULT_VCID]++;  // Increment VCID counter
-        vcdu_frame_count++;  // Increment frame counter
-        
-        // Build MPDU header inside RS block (bytes 10-11) - FHP=0 (packet at start of payload)
-        build_mpdu_header(rs_cadu_buffer, ASM_SIZE + VCDU_HEADER_SIZE, 0);
-        
-        // Copy incoming payload to bytes 12 onwards (RS input area)
-        memcpy(rs_cadu_buffer + PAYLOAD_OFFSET, fec_input_buffer, RS_PAYLOAD_SIZE);
-
-        // RS encode the 892-byte input (at offset 4)
-        for (int i = 0; i < I; i++) {
-            uint8_t msg[RS_K];
-            uint8_t parity[RS_N - RS_K];
-            for (int c = 0; c < RS_K; c++) {
-                msg[c] = rs_cadu_buffer[ASM_SIZE + c * I + i];
-            }
-            rs_encode(msg, parity);
-            for (int c = 0; c < RS_K; c++) {
-                rs_cadu_buffer[ASM_SIZE + c * I + i] = msg[c];
-            }
-            for (int c = 0; c < (RS_N - RS_K); c++) {
-                rs_cadu_buffer[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
-            }
-        }
-
-        if (dual_basis_enabled) {
-            rs_apply_dual_basis(rs_cadu_buffer + ASM_SIZE, RS_ENCODED_SIZE);
-        }
-
-        if (randomizer_enabled) {
-            for (int i = 0; i < RS_ENCODED_SIZE; i++) {
-                rs_cadu_buffer[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
-            }
-        }
-
-        push_pending_frame(rs_cadu_buffer);
-    }
-
-    bool queue_binary_frame(const uint8_t *data, uint16_t len, bool prepacked_asm) {
-        if (!can_queue_binary_frame()) return false;
-
-        if (!reed_solomon_enabled) {
-            init_frame_binary(data, len, prepacked_asm);
-            return push_pending_frame(frame);
-        }
-
-        uint16_t data_copied = 0;
-        while(data_copied < len) {
-            uint16_t to_copy = len - data_copied;
-            uint16_t space_left = sizeof(fec_input_buffer) - fec_input_buffer_len;
-            if (to_copy > space_left) to_copy = space_left;
-            
-            memcpy(fec_input_buffer + fec_input_buffer_len, data + data_copied, to_copy);
-            fec_input_buffer_len += to_copy;
-            data_copied += to_copy;
-
-            if (fec_input_buffer_len == sizeof(fec_input_buffer)) {
-                if (reed_solomon_enabled) process_rs_buffer();
-                fec_input_buffer_len = 0;
-            }
-        }
-        return true;
-    }
-
-    void clear_fec_buffer() {
-        lock_config();
-        fec_input_buffer_len = 0;
-        unlock_config();
-    }
-
     bool can_queue_binary_frame() const {
         uint8_t count = get_pending_frames_count();
         if (reed_solomon_enabled) {
@@ -667,42 +604,193 @@ public:
         return (count < PENDING_FRAME_QUEUE_SIZE - 1);
     }
 
-    void init_frame_message_only(const uint8_t *msg, uint16_t len) {
-        // ASM at bytes 0-3
+    bool has_data_to_send() const {
+        // Statically simulate the frame generation loop to see if we can safely 
+        // finish the payload without starving mid-packet and pulling 0x00 garbage bytes
+        uint32_t simulated_fifo_count = get_sp_fifo_count();
+        uint32_t simulated_sp_offset = current_sp_offset;
+        uint32_t simulated_sp_size = current_sp_size;
+        bool simulated_is_filler = is_filler;
+        uint32_t fifo_peek_offset = 0;
+
+        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
+
+        for (int i = 0; i < payload_size; i++) {
+            if (simulated_sp_offset >= simulated_sp_size) {
+                bool have_user = false;
+                if (simulated_fifo_count >= 6) {
+                    while (simulated_fifo_count >= 6 && 
+                          ((peek_sp_byte(fifo_peek_offset) & 0xF8) != 0x00 || 
+                           (peek_sp_byte(fifo_peek_offset + 2) & 0xC0) != 0xC0 ||
+                           peek_sp_byte(fifo_peek_offset + 4) >= 0x40)) {
+                        simulated_fifo_count--;
+                        fifo_peek_offset++;
+                    }
+                    if (simulated_fifo_count >= 6) {
+                        uint16_t pdl = (peek_sp_byte(fifo_peek_offset + 4) << 8) | peek_sp_byte(fifo_peek_offset + 5);
+                        uint32_t total_len = pdl + 7;
+                        if (simulated_fifo_count >= total_len) {
+                            have_user = true;
+                            simulated_sp_size = total_len;
+                            simulated_sp_offset = 0;
+                            simulated_is_filler = false;
+                        }
+                    }
+                }
+
+                if (!have_user) {
+                    if (i == 0) return false; // Stop! Defer to Idle Generator if frame contains zero user payload
+                    return true; // We can securely finish this frame's remaining buffer size with filler
+                }
+            }
+
+            if (!simulated_is_filler) {
+                if (simulated_fifo_count == 0) return false; // Starvation detected! Hand off to Idle Generator
+                simulated_fifo_count--;
+                fifo_peek_offset++;
+            }
+            simulated_sp_offset++;
+        }
+        return true; // We have enough data
+    }
+
+    bool generate_and_queue_mpdu(uint8_t vcid = VCDU_DEFAULT_VCID) {
+        if (!can_queue_binary_frame()) return false;
+
+        uint16_t fhp = 0xFFFF;
+        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
+        uint8_t payload_buf[1012];
+
+        for (int i = 0; i < payload_size; i++) {
+            if (current_sp_offset >= current_sp_size) {
+                if (fhp == 0xFFFF) fhp = i; // First Header Pointer points to the start of this packet
+
+                bool have_user_packet = false;
+                while (get_sp_fifo_count() >= 6 && 
+                      ((peek_sp_byte(0) & 0xF8) != 0x00 || 
+                       (peek_sp_byte(2) & 0xC0) != 0xC0 ||
+                       peek_sp_byte(4) >= 0x40)) {
+                    pop_sp_byte(); // Drop byte to resynchronize space packet stream
+                }
+                if (get_sp_fifo_count() >= 6) {
+                    uint16_t pdl = (peek_sp_byte(4) << 8) | peek_sp_byte(5);
+                    uint32_t total_len = pdl + 7;
+                    if (get_sp_fifo_count() >= total_len) {
+                        have_user_packet = true;
+                        current_sp_size = total_len;
+                        current_sp_offset = 0;
+                        is_filler = false;
+                    }
+                }
+
+                if (!have_user_packet) {
+                    uint16_t filler_size = (payload_size - i >= 7) ? (payload_size - i) : 7;
+                    current_sp_size = filler_size;
+                    current_sp_offset = 0;
+                    is_filler = true;
+                    filler_header[0] = 0x07;
+                    filler_header[1] = 0xFF;
+                    filler_header[2] = 0xC0 | ((filler_seq >> 8) & 0x3F);
+                    filler_header[3] = filler_seq & 0xFF;
+                    filler_seq = (filler_seq + 1) & 0x3FFF;
+                    uint16_t pdl = filler_size - 7;
+                    filler_header[4] = (pdl >> 8) & 0xFF;
+                    filler_header[5] = pdl & 0xFF;
+                }
+            }
+
+            if (is_filler) {
+                if (current_sp_offset < 6) {
+                    payload_buf[i] = filler_header[current_sp_offset];
+                } else {
+                    payload_buf[i] = 0x00; // Idle payload (all zeros per CCSDS recommendation)
+                }
+            } else {
+                payload_buf[i] = pop_sp_byte();
+            }
+            current_sp_offset++;
+        }
+
+        // Now assemble the frame
         frame[0] = 0x1A;
         frame[1] = 0xCF;
         frame[2] = 0xFC;
         frame[3] = 0x1D;
         
-        // Build VCDU header inside RS block (bytes 4-9)
-        build_vcdu_header(frame, ASM_SIZE, VCDU_DEFAULT_VCID, vcdu_frame_count, vcdu_vcid_counters[VCDU_DEFAULT_VCID]);
-        vcdu_vcid_counters[VCDU_DEFAULT_VCID]++;  // Increment VCID counter
-        vcdu_frame_count++;  // Increment frame counter
+        build_vcdu_header(frame, ASM_SIZE, vcid, vcdu_vcid_counters[vcid]);
+        vcdu_vcid_counters[vcid]++;
+        vcdu_frame_count++;
+
+        build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, fhp);
+        memcpy(frame + PAYLOAD_OFFSET, payload_buf, payload_size);
+
+        if (fecf_enabled) {
+            uint16_t crc = calculate_fecf(frame + ASM_SIZE, length_to_crc);
+            frame[ASM_SIZE + length_to_crc] = (crc >> 8) & 0xFF;
+            frame[ASM_SIZE + length_to_crc + 1] = crc & 0xFF;
+        }
+
+        if (reed_solomon_enabled) {
+            static const int I = 4;
+            static const int RS_K = 223;
+            static const int RS_N = 255;
+            
+            // Temporary buffer for RS encoding
+            uint8_t temp_rs_buf[FRAME_SIZE];
+            memcpy(temp_rs_buf, frame, FRAME_SIZE);
+            
+            for (int i = 0; i < I; i++) {
+                uint8_t msg[RS_K];
+                uint8_t parity[RS_N - RS_K];
+                for (int c = 0; c < RS_K; c++) {
+                    msg[c] = temp_rs_buf[ASM_SIZE + c * I + i];
+                }
+                rs_encode(msg, parity);
+                for (int c = 0; c < RS_K; c++) {
+                    temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
+                }
+                for (int c = 0; c < (RS_N - RS_K); c++) {
+                    temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                }
+            }
+            
+            if (dual_basis_enabled) {
+                rs_apply_dual_basis(temp_rs_buf + ASM_SIZE, 1020);
+            }
+            
+            memcpy(frame, temp_rs_buf, FRAME_SIZE);
+        }
         
-        // Build MPDU header inside RS block (bytes 10-11) - FHP=0 (packet at start of payload)
-        build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, 0);
-        
-        uint16_t pos = PAYLOAD_OFFSET;
-        for (uint16_t i = 0; i < len && pos < FRAME_SIZE; i++, pos++)
-            frame[pos] = msg[i];
-        for (uint16_t i = pos; i < FRAME_SIZE; i++)
-            frame[i] = 0x55;
         if (randomizer_enabled) {
-            for (uint16_t i = PAYLOAD_OFFSET; i < FRAME_SIZE; i++) {
-                frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - PAYLOAD_OFFSET];
+            for (uint16_t i = ASM_SIZE; i < FRAME_SIZE; i++) {
+                frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - ASM_SIZE];
             }
         }
-        prepare_tx_stream();
+        
+        return push_pending_frame(frame);
     }
 
     void queue_message(const uint8_t *msg, uint16_t len) {
-        if (len > MSG_BUFFER_SIZE) len = MSG_BUFFER_SIZE;
-        memcpy(msg_buffer, msg, len);
-        msg_len = len;
-        msg_pending = true;
+        lock_config();
+        uint32_t total_len = len + 6;
+        if (get_sp_fifo_free() >= total_len) {
+            static uint16_t msg_seq = 0;
+            push_sp_byte(0x00); // Version 0, Type 0, Sec 0, APID 1
+            push_sp_byte(0x01);
+            push_sp_byte(0xC0 | ((msg_seq >> 8) & 0x3F));
+            push_sp_byte(msg_seq & 0xFF);
+            msg_seq = (msg_seq + 1) & 0x3FFF;
+            uint16_t pdl = len - 1;
+            push_sp_byte((pdl >> 8) & 0xFF);
+            push_sp_byte(pdl & 0xFF);
+            for (uint16_t i = 0; i < len; i++) {
+                push_sp_byte(msg[i]);
+            }
+        }
+        unlock_config();
     }
-
-    bool has_pending_message() const { return msg_pending; }
 
     void clear_frame() {
         lock_config();
@@ -770,14 +858,6 @@ public:
 
     bool get_reed_solomon_enabled() const { return reed_solomon_enabled; }
 
-    void flush_fec_buffer() {
-        if (fec_input_buffer_len > 0) {
-            memset(fec_input_buffer + fec_input_buffer_len, 0x55, sizeof(fec_input_buffer) - fec_input_buffer_len);
-            if (reed_solomon_enabled) process_rs_buffer();
-            fec_input_buffer_len = 0;
-        }
-    }
-
     void set_dual_basis_enabled(bool enabled) { 
         if (dual_basis_enabled == enabled) return; // Do not interrupt running stream if unchanged!
         
@@ -796,6 +876,22 @@ public:
         unlock_config();
     }
     bool get_dual_basis_enabled() const { return dual_basis_enabled; }
+
+    void set_fecf_enabled(bool enabled) {
+        if (fecf_enabled == enabled) return;
+        
+        lock_config();
+        bool was_running = running;
+        if (was_running) stop();
+        
+        fecf_enabled = enabled;
+        clear_baseband_state();
+        build_oid_frame();
+        
+        if (was_running) start();
+        unlock_config();
+    }
+    bool get_fecf_enabled() const { return fecf_enabled; }
 
     void set_randomizer_enabled(bool enabled) {
         if (randomizer_enabled == enabled) return; // Do not interrupt running stream if unchanged!
@@ -823,38 +919,6 @@ public:
             start();
         }
         unlock_config();
-    }
-
-    void inject_message() {
-        if (!msg_pending || msg_len == 0) return;
-        if (!can_queue_binary_frame()) return;
-
-        if (!reed_solomon_enabled) {
-            init_frame_with_message(msg_buffer, msg_len);
-            push_pending_frame(frame);
-        } else {
-            // Buffer for FEC encoding
-            uint16_t data_copied = 0;
-            while(data_copied < msg_len) {
-                uint16_t to_copy = msg_len - data_copied;
-                uint16_t space_left = sizeof(fec_input_buffer) - fec_input_buffer_len;
-                if (to_copy > space_left) to_copy = space_left;
-
-                memcpy(fec_input_buffer + fec_input_buffer_len, msg_buffer + data_copied, to_copy);
-                fec_input_buffer_len += to_copy;
-                data_copied += to_copy;
-
-                if (fec_input_buffer_len == sizeof(fec_input_buffer)) {
-                    if (reed_solomon_enabled) process_rs_buffer();
-                    fec_input_buffer_len = 0;
-                }
-            }
-            
-            // Pad the rest of the FEC block with 0x55 so the text message is actually transmitted
-            flush_fec_buffer();
-        }
-
-        msg_pending = false;
     }
 
     void set_symbolrate(uint32_t hz) {
@@ -891,18 +955,26 @@ public:
     bool process_baseband_to_dma() {
         if (queue_is_full(&dma_chunk_queue)) return false;
 
+        bool is_tracked_frame = true;
         if (!pop_pending_frame(current_tx_frame)) {
+            is_tracked_frame = false; // Mark this as an auto-generated Idle chunk
             // Always generate a fresh OID frame when no user data is available (CCSDS compliant idle data)
             // This ensures continuous transmission to prevent Viterbi lock loss
             memcpy(current_tx_frame, oid_frame, FRAME_SIZE);
             
             // Update VCDU header for OID frame inside RS block (bytes 4-9)
-            build_vcdu_header(current_tx_frame, VCDU_OFFSET, 0x3F, vcdu_frame_count, vcdu_vcid_counters[0x3F]);
+            build_vcdu_header(current_tx_frame, VCDU_OFFSET, 0x3F, vcdu_vcid_counters[0x3F]);
             vcdu_vcid_counters[0x3F]++;  // Increment OID VCID counter
             vcdu_frame_count++;  // Increment master frame counter
             
-            // Update MPDU header inside RS block (bytes 10-11) - FHP=0xFFFF (no packet start in OID)
-            build_mpdu_header(current_tx_frame, MPDU_OFFSET, 0xFFFF);
+            // Note: NO MPDU header update here! VCID 63 does not have one!
+            
+            if (fecf_enabled) {
+                uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - 2;
+                uint16_t crc = calculate_fecf(current_tx_frame + ASM_SIZE, length_to_crc);
+                current_tx_frame[ASM_SIZE + length_to_crc] = (crc >> 8) & 0xFF;
+                current_tx_frame[ASM_SIZE + length_to_crc + 1] = crc & 0xFF;
+            }
             
             // Apply RS encoding and randomization to OID frame if enabled
             if (reed_solomon_enabled) {
@@ -1013,15 +1085,19 @@ public:
             }
         }
         generation_chunk.length = words_written;
+        generation_chunk.is_user_data = is_tracked_frame ? 1 : 0;
         queue_try_add(&dma_chunk_queue, &generation_chunk);
         return true;
     }
 
-    uint32_t fill_dma_buffer(uint32_t *out_buf) {
+    __attribute__((section(".time_critical.bpsk"))) uint32_t fill_dma_buffer(uint32_t *out_buf) {
         uint32_t total_words = 0;
         // Batch pull up to DMA_BUFFER_MULTIPLIER chunks to give Core 0 massive breathing room
         while (total_words + (FRAME_SIZE / 2) <= (FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER) {
             if (queue_try_remove(&dma_chunk_queue, &dma_irq_chunk)) {
+                if (dma_irq_chunk.is_user_data) {
+                    tx_user_chunks_dma_cleared++; // Acknowledge user data successfully hit the RF transmission stage
+                }
                 if (dma_irq_chunk.length > 0) {
                     memcpy(out_buf + total_words, dma_irq_chunk.words, dma_irq_chunk.length * 4);
                     total_words += dma_irq_chunk.length;
@@ -1041,7 +1117,7 @@ public:
         return total_words;
     }
 
-    void handle_dma_irq() {
+    __attribute__((section(".time_critical.bpsk"))) void handle_dma_irq() {
         if (!running) {
             // Safely sink phantom interrupts from aborted transfers to prevent memory corruption
             if (dma_channel_get_irq0_status(dma_chan_0)) dma_channel_acknowledge_irq0(dma_chan_0);
@@ -1051,7 +1127,7 @@ public:
         
         if (dma_channel_get_irq0_status(dma_chan_0)) {
             dma_channel_acknowledge_irq0(dma_chan_0);
-            dma_channel_start(dma_chan_1); // Instantly hot-swap to the pre-filled channel to maintain RF carrier!
+            dma_channel_start(dma_chan_1); // Restore software chaining to prevent hardware deadlock
             
             uint32_t len = fill_dma_buffer(dma_buf[0]);
             dma_channel_set_trans_count(dma_chan_0, len, false);
@@ -1059,7 +1135,7 @@ public:
         } 
         else if (dma_channel_get_irq0_status(dma_chan_1)) {
             dma_channel_acknowledge_irq0(dma_chan_1);
-            dma_channel_start(dma_chan_0); // Instantly hot-swap to the pre-filled channel to maintain RF carrier!
+            dma_channel_start(dma_chan_0); // Restore software chaining to prevent hardware deadlock
             
             uint32_t len = fill_dma_buffer(dma_buf[1]);
             dma_channel_set_trans_count(dma_chan_1, len, false);
@@ -1160,7 +1236,7 @@ public:
 
 BPSKModulator* g_modulator_instance = nullptr;
 
-void bpsk_dma_isr() {
+void __not_in_flash_func(bpsk_dma_isr)() {
     if (g_modulator_instance != nullptr) {
         g_modulator_instance->handle_dma_irq();
     }

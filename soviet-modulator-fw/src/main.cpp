@@ -27,35 +27,7 @@ static bool waiting_for_input = false;
 static char input_mode = '\0';
 
 static bool binary_upload_mode = false;
-static bool binary_upload_finishing = false;
-static unsigned long binary_finish_started_ms = 0;
-static bool binary_upload_prepacked_asm = false;
-static bool binary_upload_waiting_for_mode = false;
-static bool binary_upload_chunk_pending_enqueue = false;
-static uint8_t binary_len_buf[2];
-static uint8_t binary_len_idx = 0;
-static uint16_t binary_expected_len = 0;
-static uint16_t binary_received_len = 0;
-alignas(4) static uint8_t binary_payload_buf[FRAME_SIZE];
-static uint16_t binary_pending_chunk_len = 0;
-static bool binary_pending_chunk_prepacked_asm = false;
-alignas(4) static uint8_t binary_pending_chunk_buf[FRAME_SIZE];
-
-struct BinaryQueueItem {
-    alignas(4) uint8_t data[FRAME_SIZE];
-    uint16_t len;
-    bool prepacked_asm;
-};
-
-// Set to ~256 KB queue to use more of our free RAM for maximum USB jitter resilience
-static constexpr uint16_t BINARY_QUEUE_CAPACITY = (262144 / sizeof(BinaryQueueItem)) > 0 ? (262144 / sizeof(BinaryQueueItem)) : 2; 
-static queue_t binary_queue;
-static uint32_t binary_frames_enqueued_total = 0;
-static uint32_t binary_frames_dequeued_total = 0;
-static bool binary_tx_drain_complete = false;
-static volatile bool request_fec_flush = false;
 static unsigned long last_binary_rx_ms = 0;
-static bool binary_error_sink_mode = false;
 
 static unsigned long current_frame_period_ms() {
 	if (modulator == nullptr) return 100;
@@ -82,91 +54,6 @@ static unsigned long current_frame_period_ms() {
 	return (unsigned long)(period_ms + 2U);
 }
 
-static uint16_t get_binary_queue_count() {
-	return queue_get_level(&binary_queue);
-}
-
-static void reset_binary_queue() {
-	static BinaryQueueItem dummy;
-	while (queue_try_remove(&binary_queue, &dummy));
-}
-
-static void reset_binary_upload_state() {
-	binary_upload_waiting_for_mode = false;
-	binary_upload_prepacked_asm = false;
-	binary_upload_chunk_pending_enqueue = false;
-	binary_len_idx = 0;
-	binary_expected_len = 0;
-	binary_received_len = 0;
-	binary_pending_chunk_len = 0;
-	binary_pending_chunk_prepacked_asm = false;
-}
-
-static bool try_enqueue_pending_chunk() {
-	if (!binary_upload_chunk_pending_enqueue) return true;
-
-	static BinaryQueueItem item;
-	memcpy(item.data, binary_pending_chunk_buf, binary_pending_chunk_len);
-	item.len = binary_pending_chunk_len;
-	item.prepacked_asm = binary_pending_chunk_prepacked_asm;
-	
-	if (!queue_try_add(&binary_queue, &item)) {
-		return false;
-	}
-
-	binary_frames_enqueued_total++;
-	binary_tx_drain_complete = false;
-	binary_upload_chunk_pending_enqueue = false;
-	binary_pending_chunk_len = 0;
-	last_binary_rx_ms = millis();
-	binary_expected_len = 0;
-	binary_received_len = 0;
-	Serial.write('K'); // Acknowledge successful enqueue to perfectly pace the Python script
-	return true;
-}
-
-static void process_binary_upload_byte(uint8_t b) {
-	if (binary_upload_chunk_pending_enqueue) {
-		return;
-	}
-
-	if (binary_upload_waiting_for_mode) {
-		binary_upload_prepacked_asm = (b != 0);
-		binary_upload_waiting_for_mode = false;
-		return;
-	}
-
-	if (binary_expected_len == 0) {
-		binary_len_buf[binary_len_idx++] = b;
-		if (binary_len_idx < 2) return;
-
-		binary_expected_len = (uint16_t)binary_len_buf[0] | ((uint16_t)binary_len_buf[1] << 8);
-		binary_len_idx = 0;
-
-		if (binary_expected_len == 0) {
-			binary_upload_mode = false;
-			binary_upload_finishing = true;
-			binary_finish_started_ms = 0;
-			binary_tx_drain_complete = false;
-			request_fec_flush = true; // Signal Core 1 to flush when queue empties safely
-			reset_binary_upload_state();
-			return;
-		}
-
-		uint16_t binary_chunk_max = binary_upload_prepacked_asm ? FRAME_SIZE : (FRAME_SIZE - PAYLOAD_OFFSET);
-		if (binary_expected_len > binary_chunk_max) {
-			binary_upload_mode = false;
-			binary_upload_finishing = false;
-			binary_finish_started_ms = 0;
-			binary_error_sink_mode = true; // Safely absorb and destroy remaining garbage data from USB
-			reset_binary_upload_state();
-			Serial.write('E');
-			return;
-		}
-		return;
-	}
-}
-
 /*
 Command summary:
   r <rate> - Set symbol rate (1-100000 Hz)
@@ -179,6 +66,7 @@ Command summary:
 	n - Toggle CCSDS randomizer
 	d - Toggle CCSDS dual basis conversion
 	y - Toggle Reed-Solomon (255,223) I=4 encoding
+	e - Toggle Frame Error Control Field (FECF)
 	q - Print upload/FIFO status
   t <data> - Transmit message (ASCII text)
   x - Reinitialize Si5351 LO to 51 MHz
@@ -237,7 +125,8 @@ void print_help() {
 	Serial.println("  q - Print upload/FIFO status");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
 	Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
-	Serial.println("  u - Binary upload mode (mode byte, len16 + data, len=0 ends)");
+	Serial.println("  e - Toggle Frame Error Control Field (FECF)");
+	Serial.println("  u - Binary upload mode (raw Space Packets, timeout 5s exits)");
 	Serial.println("  x - Reinitialize Si5351 LO to 51 MHz");
 	Serial.println("  o - Queue OID (Operational Idle Data) frame (VCID=0x3F)");
 	Serial.println("  I <vcid> - Queue idle data MPDU frame with specified VCID (0-63)");
@@ -249,8 +138,6 @@ void print_help() {
 void setup() {
 	delay(100); // Allow hardware peripherals (Si5351) a fraction of a second to cleanly power up
 	set_sys_clock_khz(250000, true); // Overclock RP2350 to 250 MHz for high-speed stability
-
-	queue_init(&binary_queue, sizeof(BinaryQueueItem), BINARY_QUEUE_CAPACITY);
 
 	pinMode(LED_PIN, OUTPUT);
 	digitalWrite(LED_PIN, LOW);
@@ -337,38 +224,20 @@ void loop1() {
 	__dmb(); // Ensure we see the latest config_lock state from Core 0
 	if (modulator->config_lock) return;
 
-	// Drain as many incoming USB chunks as physically possible to maximize payload speed
-	static BinaryQueueItem item;
-	while (get_binary_queue_count() > 0 && modulator->can_queue_binary_frame()) {
+	// 1. Pack the pending frame queue with as much MPDU user payload as possible
+	while (modulator->can_queue_binary_frame()) {
 		__dmb();
 		if (modulator->config_lock) break;
-		if (queue_try_remove(&binary_queue, &item)) {
-			modulator->queue_binary_frame(item.data, item.len, item.prepacked_asm);
-			binary_frames_dequeued_total++;
-		}
+		if (!modulator->has_data_to_send()) break;
+		modulator->generate_and_queue_mpdu();
 	}
 
-	if (request_fec_flush && get_binary_queue_count() == 0 && !modulator->config_lock) {
-		if (!modulator->config_lock && modulator->can_queue_binary_frame()) { 
-			modulator->flush_fec_buffer();
-			request_fec_flush = false;
-		}
-	}
-
-	// Drain baseband queue into DMA chunk queue
+	// 2. Drain baseband queue into DMA chunk queue
 	while (true) {
 		__dmb();
 		if (modulator->config_lock) break;
 		if (!modulator->process_baseband_to_dma()) break; // Break when DMA queue hits 14 chunks
 		delayMicroseconds(50); // Prevent Core 1 from starving the system bus
-	}
-
-	if (modulator->has_pending_message()) {
-		unsigned long now = millis();
-		if (now - frame_start >= current_frame_period_ms()) {
-			modulator->inject_message();
-			frame_start = now;
-		}
 	}
 }
 
@@ -385,86 +254,25 @@ void loop() {
 		last_blink = now;
 	}
 
-	if (binary_upload_mode && binary_upload_chunk_pending_enqueue) {
-		(void)try_enqueue_pending_chunk();
-	}
-
-	if (binary_upload_finishing) {
-		if (get_binary_queue_count() == 0 && modulator->get_pending_frames_count() == 0 && modulator->get_dma_chunks_count() == 0 && !request_fec_flush) {
-			if (binary_finish_started_ms == 0) {
-				binary_finish_started_ms = now;
-			} else if (now - binary_finish_started_ms >= current_frame_period_ms()) {
-				binary_upload_finishing = false;
-				binary_finish_started_ms = 0;
-				binary_tx_drain_complete = true;
-				Serial.write('D');
-			}
-		} else {
-			binary_finish_started_ms = 0;
-		}
-	}
-
-	// Safety Timeout: If Python crashes or drops, automatically escape Binary Mode after 5 minutes of silence.
-	// This must be significantly longer than the time it takes to transmit one DMA block at 
-	// the slowest supported symbol rate (e.g., 1200 baud).
-	if ((binary_upload_mode || binary_error_sink_mode) && !Serial.available()) {
-		if (now - last_binary_rx_ms > 300000) {
+	// Safety Timeout: Escape Binary Mode after 5 seconds of silence.
+	if (binary_upload_mode && !Serial.available()) {
+		if (now - last_binary_rx_ms > 5000) {
 			binary_upload_mode = false;
-			binary_upload_finishing = false;
-			binary_upload_chunk_pending_enqueue = false;
-			binary_error_sink_mode = false;
-			reset_binary_upload_state();
-			request_fec_flush = true;
 			Serial.println("\n[MCU] Binary mode timeout/reset! Returning to command mode.");
 		}
 	}
 
 	if (Serial.available()) {
-		if (binary_error_sink_mode) {
-			last_binary_rx_ms = now; // Reset the timeout watchdog
-			while (Serial.available()) Serial.read(); // Dump garbage so it isn't parsed as reboot commands
-			return;
-		}
-
-		if (binary_upload_mode && Serial.available()) {
-			while (binary_upload_mode && Serial.available()) {
-				if (binary_upload_chunk_pending_enqueue) {
-					break; // Queue full, stop pulling bytes from Serial buffer to prevent dropping
-				}
-				
-				if (binary_expected_len > 0) {
+		if (binary_upload_mode) {
+			while (Serial.available()) {
+				if (modulator->get_sp_fifo_free() > 0) {
+					modulator->push_sp_byte((uint8_t)Serial.read());
 					last_binary_rx_ms = now; // Only reset watchdog when we actually pull data
-					size_t to_read = binary_expected_len - binary_received_len;
-					size_t avail = Serial.available();
-					if (avail < to_read) to_read = avail;
-					
-					// Use a tight loop to bypass the massive millis() overhead inside Stream::readBytes()
-					for (size_t i = 0; i < to_read; i++) {
-						binary_payload_buf[binary_received_len++] = (uint8_t)Serial.read();
-					}
-					
-					if (binary_received_len >= binary_expected_len) {
-						memcpy(binary_pending_chunk_buf, binary_payload_buf, binary_expected_len);
-						binary_pending_chunk_len = binary_expected_len;
-						binary_pending_chunk_prepacked_asm = binary_upload_prepacked_asm;
-						binary_upload_chunk_pending_enqueue = true;
-						
-						if (!try_enqueue_pending_chunk()) {
-							yield(); // Let system tasks run while waiting for queue space
-							break; // Queue actually full, yield execution to system
-						}
-						
-						// Force loop() to return after every chunk to service TinyUSB background tasks!
-						// This prevents tud_task() starvation and USB driver deadlocks during high-speed blasts.
-						break;
-					}
 				} else {
-					process_binary_upload_byte((uint8_t)Serial.read());
+					break; // Wait for space, yields to background tasks naturally
 				}
 			}
-			if (binary_upload_mode) {
-				return;
-			}
+			return;
 		}
 
 		// Prevent reading -1 when binary mode exits and buffer is empty
@@ -476,20 +284,9 @@ void loop() {
 			waiting_for_input = false;
 			input_idx = 0;
 			binary_upload_mode = true;
-			binary_upload_finishing = false;
-			binary_finish_started_ms = 0;
-			binary_tx_drain_complete = false;
-			request_fec_flush = false; // Cancel any pending flush from aborted runs
 			
-			modulator->lock_config();
-			reset_binary_queue(); // Safely reset queue pointers while Core 1 is paused
-			reset_binary_upload_state();
-			modulator->unlock_config();
+			modulator->reset_baseband_queues();
 			
-			modulator->clear_fec_buffer(); // Only clear the FEC buffer to seamlessly transition from filler to data
-			
-			// Buffers naturally clear on mode toggle or flush
-			binary_upload_waiting_for_mode = true;
 			last_binary_rx_ms = millis(); // Initialize watchdog timer
 			Serial.write('B');
 			return;
@@ -580,6 +377,13 @@ void loop() {
 					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
 					break;
 				}
+				case 'e': {
+					bool current = modulator->get_fecf_enabled();
+					modulator->set_fecf_enabled(!current);
+					Serial.print("FECF (CRC-16): ");
+					Serial.println(modulator->get_fecf_enabled() ? "ON" : "OFF");
+					break;
+				}
 				case 't': {
 					Serial.println("Enter message:");
 					waiting_for_input = true;
@@ -593,6 +397,8 @@ void loop() {
 					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
 					Serial.print("  Dual Basis: ");
 					Serial.println(modulator->get_dual_basis_enabled() ? "ON" : "OFF");
+					Serial.print("  FECF (CRC-16): ");
+					Serial.println(modulator->get_fecf_enabled() ? "ON" : "OFF");
 					Serial.print("  Randomizer: ");
 					Serial.println(modulator->get_randomizer_enabled() ? "ON" : "OFF");
 					Serial.print("  Convolutional: ");
@@ -610,23 +416,22 @@ void loop() {
 					}
 					Serial.println();
 					Serial.print("  Expected Payload: ");
-					Serial.print(modulator->get_reed_solomon_enabled() ? 892 : 1020);
-					Serial.println(" bytes (1024 if prepacked ASM)");
-					Serial.println("Upload/FIFO status:");
-					Serial.print("  queue depth: ");
-					Serial.print(get_binary_queue_count());
+					uint16_t ep = (modulator->get_reed_solomon_enabled() ? 892 : 1020) - (modulator->get_fecf_enabled() ? 2 : 0) - 8;
+					Serial.print(ep);
+					Serial.println(" bytes");
+					Serial.println("Space Packet FIFO status:");
+					Serial.print("  FIFO depth: ");
+					Serial.print(modulator->get_sp_fifo_count());
 					Serial.print("/");
-					Serial.println(BINARY_QUEUE_CAPACITY);
-					Serial.print("  enqueued total: ");
-					Serial.println(binary_frames_enqueued_total);
-					Serial.print("  dequeued total: ");
-					Serial.println(binary_frames_dequeued_total);
+					Serial.println("131072 bytes");
+					Serial.print("  TX Frames pending: ");
+					Serial.println(modulator->get_pending_frames_count());
+					Serial.print("  TX Chunks pending: ");
+					Serial.println(modulator->get_dma_chunks_count());
+					Serial.print("  Active User Chunks: ");
+					Serial.println(modulator->get_active_user_chunks());
 					Serial.print("  upload active: ");
 					Serial.println(binary_upload_mode ? "YES" : "NO");
-					Serial.print("  upload finishing: ");
-					Serial.println(binary_upload_finishing ? "YES" : "NO");
-					Serial.print("  tx drain complete: ");
-					Serial.println(binary_tx_drain_complete ? "YES" : "NO");
 					break;
 				}
 				case 'x': {

@@ -14,7 +14,7 @@ def get_status(ser):
     response = b""
     while time.time() - start_time < 2.0:
         response += ser.read_all()
-        if b"tx drain complete:" in response:
+        if b"upload active:" in response:
             break
         time.sleep(0.05)
 
@@ -58,15 +58,16 @@ def print_progress(bytes_sent, total_size, start_time):
     sys.stdout.flush()
 
 
-def print_drain_progress(current, total):
-    percent = ((total - current) / total) * 100 if total > 0 else 100.0
-    bar_len = 30
-    filled = int(bar_len * (total - current) / total) if total > 0 else bar_len
-    bar = "=" * filled + "-" * (bar_len - filled)
-    sys.stdout.write(
-        f"\rDraining TX FIFO: [{bar}] {percent:.1f}% | {current}/{total} frames remaining    "
-    )
-    sys.stdout.flush()
+def generate_space_packet(apid, seq, payload):
+    header = bytearray(6)
+    header[0] = (apid >> 8) & 0x07
+    header[1] = apid & 0xFF
+    header[2] = 0xC0 | ((seq >> 8) & 0x3F)
+    header[3] = seq & 0xFF
+    pdl = len(payload) - 1
+    header[4] = (pdl >> 8) & 0xFF
+    header[5] = pdl & 0xFF
+    return header + payload
 
 
 def main():
@@ -100,9 +101,19 @@ def main():
         "--dual", type=int, choices=[0, 1], help="0=Disable, 1=Enable Dual Basis"
     )
     parser.add_argument(
-        "--prepacked",
-        action="store_true",
-        help="Indicate frames already contain 4-byte ASM",
+        "--fecf", type=int, choices=[0, 1], help="0=Disable, 1=Enable FECF"
+    )
+    parser.add_argument(
+        "--apid",
+        type=int,
+        default=1,
+        help="Application Process ID (APID) for Space Packets (default: 1)",
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=1000,
+        help="Number of payload bytes per Space Packet (default: 1000)",
     )
     parser.add_argument(
         "file", help="Binary file to upload (use '-' for standard input)"
@@ -131,7 +142,15 @@ def main():
 
     if any(
         a is not None
-        for a in [args.rate, args.crate, args.rs, args.conv, args.rand, args.dual]
+        for a in [
+            args.rate,
+            args.crate,
+            args.rs,
+            args.conv,
+            args.rand,
+            args.dual,
+            args.fecf,
+        ]
     ):
         print("\nApplying desired FEC settings...")
 
@@ -157,6 +176,8 @@ def main():
             toggle_if_needed(ser, status, "Randomizer", args.rand == 1, "n")
         if args.dual is not None:
             toggle_if_needed(ser, status, "Dual Basis", args.dual == 1, "d")
+        if args.fecf is not None:
+            toggle_if_needed(ser, status, "FECF (CRC-16)", args.fecf == 1, "e")
 
         # Re-fetch status after toggles are applied to get the new Expected Payload
         status = get_status(ser)
@@ -164,6 +185,7 @@ def main():
     print("\n--- Final Modulator Status ---")
     for k in [
         "RS (255,223)",
+        "FECF (CRC-16)",
         "Convolutional",
         "Randomizer",
         "Dual Basis",
@@ -172,22 +194,6 @@ def main():
         print(f"  {k}: {status.get(k, 'Unknown')}")
     print("------------------------------\n")
 
-    # Determine chunk size from final status
-    chunk_size = 1020
-    if "Expected Payload" in status:
-        val = status["Expected Payload"]
-        if "892" in val:
-            chunk_size = 892
-        elif "1020" in val:
-            chunk_size = 1024 if args.prepacked else 1020
-    else:
-        # Fallback if expected payload isn't parsed
-        chunk_size = (
-            892
-            if status.get("RS (255,223)") == "ON"
-            else (1024 if args.prepacked else 1020)
-        )
-
     # Ensure modulation is started
     print("Starting modulation...")
     ser.write(b"s")
@@ -195,6 +201,7 @@ def main():
     ser.read_all()
 
     # Enter binary upload mode
+    print("Entering binary upload mode and resetting MCU buffers...")
     ser.write(b"u")
 
     # Wait securely for the 'B' ready signal
@@ -213,13 +220,10 @@ def main():
             "Warning: Did not receive 'B' ready signal. Modulator might not be ready."
         )
 
-    # Send mode byte (0 for append ASM, 1 for prepacked)
-    mode_byte = b"\x01" if args.prepacked else b"\x00"
-    ser.write(mode_byte)
+    print("Waiting 2.0s for SDR to achieve PLL lock on the idle carrier...")
+    time.sleep(2.0)
 
-    print(
-        f"Starting upload from {'stdin' if args.file == '-' else args.file} (Chunk size: {chunk_size} bytes)"
-    )
+    print(f"Starting upload from {'stdin' if args.file == '-' else args.file}...")
 
     # Read and upload file in chunks
     f = sys.stdin.buffer if args.file == "-" else open(args.file, "rb")
@@ -228,118 +232,85 @@ def main():
     start_time = time.time()
     last_ui_update = 0
 
-    window_size = 128  # Aggressive sliding window to saturate the USB pipe and overcome OS polling latency
-    in_flight = 0
-    chunk_ready_to_read = True
+    seq = 0
+    sp_payload_size = args.size  # Keep Space Packets comfortably inside FIFO capacity
 
     try:
-        while chunk_ready_to_read or in_flight > 0:
-            # 1. Drain pending ACKs non-blockingly
-            if ser.in_waiting > 0:
-                err_check = ser.read(ser.in_waiting)
-                in_flight -= err_check.count(b"K")
-                if b"E" in err_check:
-                    print("\n\nError: MCU rejected the chunk size. Disconnecting.")
-                    sys.exit(1)
+        while True:
+            chunk = f.read(sp_payload_size)
+            if not chunk:
+                break
 
-            # 2. Batch read/serialize to blast to the OS in one massive USB Bulk Transfer
-            payload_batch = bytearray()
-            chunks_added = 0
+            packet = generate_space_packet(args.apid, seq, chunk)
+            seq = (seq + 1) & 0x3FFF
 
-            while (
-                in_flight + chunks_added < window_size
-                and chunk_ready_to_read
-                and len(payload_batch) < 32768
-            ):
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    chunk_ready_to_read = False
-                    break
-
-                payload_batch.extend(len(chunk).to_bytes(2, byteorder="little"))
-                payload_batch.extend(chunk)
-                chunks_added += 1
-                bytes_sent += len(chunk)
-
-            if chunks_added > 0:
+            # Write directly; TinyUSB CDC backpressure will safely block PySerial if the 128KB MCU FIFO fills!
+            # We chunk this to 64 bytes to perfectly bypass Windows usbser.sys buffer overflow bugs
+            written = 0
+            while written < len(packet):
                 try:
-                    ser.write(payload_batch)
+                    chunk_size = min(64, len(packet) - written)
+                    res = ser.write(packet[written : written + chunk_size])
+                    if res:
+                        written += res
                 except serial.SerialTimeoutException:
-                    print("\n\nError: USB Write Timeout. The MCU stopped reading data.")
+                    print(
+                        "\n\nError: USB Write Timeout. The MCU stopped receiving data."
+                    )
                     sys.exit(1)
 
-                in_flight += chunks_added
+            bytes_sent += len(chunk)
 
-                now = time.time()
-                if (
-                    now - last_ui_update > 0.2
-                ):  # Update console at 5Hz to prevent terminal lag
-                    print_progress(bytes_sent, total_size, start_time)
-                    last_ui_update = now
-
-        # Ensure all in-flight chunks are acknowledged before finishing
-        while in_flight > 0:
-            acks = ser.read(max(1, ser.in_waiting))
-            if acks:
-                in_flight -= acks.count(b"K")
-            else:
-                # Safety timeout for final ACKs
-                if time.time() - last_ui_update > 10.0:
-                    print("\nWarning: Timeout waiting for final acknowledgments.")
-                    break
+            now = time.time()
+            if now - last_ui_update > 0.2:  # Update console at 5Hz
+                print_progress(bytes_sent, total_size, start_time)
+                last_ui_update = now
 
         print_progress(bytes_sent, total_size, start_time)
 
-        # 1. Send End of Stream and wait a moment for MCU to transition state
-        ser.write(b"\x00\x00")
-        time.sleep(0.5)
         print(
-            "\n\nUpload buffered successfully! Waiting for radio transmission to drain..."
+            "\n\nUpload pushed to hardware FIFO successfully!\nThe modulator will continuously transmit the buffered packets."
         )
 
-        max_queue = 0
-        last_q_request = 0
+        print("Waiting for MCU to empty USB buffer and exit binary mode...", end="")
+        sys.stdout.flush()
         while True:
-            # Poll for status every 500ms
-            now = time.time()
-            if now - last_q_request > 0.5:
-                ser.write(b"q")
-                last_q_request = now
+            line = ser.readline()
+            if b"Binary mode timeout" in line:
+                print()
+                break
+            if not line:
+                sys.stdout.write(".")
+                sys.stdout.flush()
 
-            # Read everything available
-            if ser.in_waiting > 0:
-                raw_data = ser.read(ser.in_waiting)
-                text = raw_data.decode("utf-8", errors="ignore")
+        print("Monitoring FIFO drain progress...")
+        while True:
+            status = get_status(ser)
+            if "FIFO depth" not in status:
+                # MCU hasn't responded to 'q' yet, wait and try again
+                time.sleep(1.0)
+                continue
 
-                current_status = {}
-                current_q = 0
-                for line in text.split("\n"):
-                    if "queue depth:" in line:
-                        try:
-                            parts = line.split("queue depth:")[1].strip().split("/")
-                            current_q = int(parts[0])
-                            if max_queue == 0:
-                                max_queue = int(parts[1].split()[0])
-                            print_drain_progress(current_q, max_queue)
-                        except (IndexError, ValueError):
-                            pass
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        current_status[k.strip()] = v.strip()
-
-                # Exit if drain is complete, OR if we are desynced (not active/finishing) but queue is empty
-                is_complete = current_status.get("tx drain complete") == "YES"
-                is_active = current_status.get("upload active") == "YES"
-                is_finishing = current_status.get("upload finishing") == "YES"
-
-                if is_complete or (
-                    not is_active and not is_finishing and current_q == 0
-                ):
-                    if max_queue > 0:
-                        print_drain_progress(0, max_queue)
-                    print("\n\nDrain complete. Transmission finished!")
+            fifo_str = status.get("FIFO depth", "0")
+            frames_str = status.get("TX Frames pending", "0")
+            chunks_str = status.get("Active User Chunks", "0")
+            try:
+                depth = int(fifo_str.split("/")[0])
+                frames = int(frames_str)
+                chunks = int(chunks_str)
+                if depth == 0 and frames == 0 and chunks == 0:
+                    time.sleep(
+                        1.0
+                    )  # Give it 1 extra second to ensure the final PIO bits physically left the antenna
+                    print("\nQueues drained completely! Transmission finished.")
                     break
-            time.sleep(0.1)
+                sys.stdout.write(
+                    f"\rDraining: {depth} bytes | {frames} frames | {chunks} chunks left...    "
+                )
+                sys.stdout.flush()
+            except ValueError:
+                pass
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         print("\n\nOperation interrupted by user. Closing...")
