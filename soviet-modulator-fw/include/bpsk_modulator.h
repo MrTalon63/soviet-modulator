@@ -84,7 +84,7 @@ static constexpr uint8_t RANDOMIZER8_TABLE[255] = {
 const int CADU_ASM_SIZE = 4;
 static constexpr uint32_t CADU_ASM = 0x1ACFFC1D;  // CCSDS standard ASM: 0x1A 0xCF 0xFC 0x1D
 
-struct BPSKRandomizerFastLut {
+struct alignas(4) BPSKRandomizerFastLut {
     uint8_t seq[FRAME_SIZE];
     constexpr BPSKRandomizerFastLut() : seq{} {
         for (int i = 0; i < FRAME_SIZE; i++) {
@@ -170,18 +170,26 @@ struct OIDFrameRandomizer {
 // Static instance - constructor runs at runtime to initialize pattern
 static OIDFrameRandomizer OID_FRAME_PATTERN;
 
-static uint16_t calculate_fecf(const uint8_t *data, uint16_t length) {
+struct Crc16CcittFastLut {
+    uint16_t table[256];
+    constexpr Crc16CcittFastLut() : table{} {
+        for (int i = 0; i < 256; i++) {
+            uint16_t crc = (uint16_t)(i << 8);
+            for (uint8_t j = 0; j < 8; j++) {
+                if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+                else crc = (crc << 1);
+            }
+            table[i] = crc;
+        }
+    }
+};
+static Crc16CcittFastLut CRC16_FAST_LUT;
+
+__attribute__((always_inline)) static inline uint16_t calculate_fecf(const uint8_t *data, uint16_t length) {
     // CCSDS 732.0-B-5 Section 4.1.6.2: CRC-16-CCITT, Initial=0xFFFF, No final XOR
     uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < length; i++) {
-        crc ^= ((uint16_t)data[i] << 8);
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x8000) {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc = (crc << 1);
-            }
-        }
+        crc = (crc << 8) ^ CRC16_FAST_LUT.table[((crc >> 8) ^ data[i]) & 0xFF];
     }
     return crc;
 }
@@ -268,6 +276,12 @@ private:
 
     static constexpr int DMA_CHUNK_QUEUE_SIZE = 32;
     queue_t dma_chunk_queue;
+
+    // Heap-allocated buffers to prevent Core 1 Stack Overflows (4KB stack limit)
+    alignas(4) uint8_t mpdu_payload_buf[1012];
+    alignas(4) uint8_t mpdu_temp_rs_buf[FRAME_SIZE];
+    alignas(4) uint8_t bb_temp_rs_buf[FRAME_SIZE];
+    alignas(4) DmaChunk bb_generation_chunk;
 
     volatile uint32_t tx_user_frames_generated = 0;
     volatile uint32_t tx_user_chunks_dma_cleared = 0;
@@ -395,7 +409,7 @@ public:
     }
 
 
-    void build_vcdu_header(uint8_t *frame, uint16_t frame_offset, uint8_t vcid, uint32_t frame_count) {
+    __attribute__((section(".time_critical.build_vcdu_header"))) void build_vcdu_header(uint8_t *frame, uint16_t frame_offset, uint8_t vcid, uint32_t frame_count) {
         // Build VCDU (Virtual Channel Data Unit) Transfer Frame Header (6 bytes) per CCSDS 732.0-B-5
         // frame_offset: offset into frame buffer (typically ASM_SIZE = 4 for RS blocks)
         
@@ -422,7 +436,7 @@ public:
         memset(vcdu_vcid_counters, 0, sizeof(vcdu_vcid_counters));
     }
 
-    void build_mpdu_header(uint8_t *frame, uint16_t frame_offset, uint16_t first_header_ptr) {
+    __attribute__((section(".time_critical.build_mpdu_header"))) void build_mpdu_header(uint8_t *frame, uint16_t frame_offset, uint16_t first_header_ptr) {
         // Build MPDU (Multiplexing Protocol Data Unit) Header (2 bytes) per CCSDS 732.0-B-5
         // Bits 0-15: First Header Pointer (16-bit value, position of first packet start in MPDU Packet Zone)
         // frame_offset: offset into frame buffer
@@ -464,7 +478,7 @@ public:
         uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
         uint16_t oid_payload_size = length_to_crc - VCDU_HEADER_SIZE;
         for (uint16_t i = 0; i < oid_payload_size; i++) {
-            oid_frame[ASM_SIZE + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i % 256];
+            oid_frame[ASM_SIZE + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i & 0xFF];
         }
 
         if (fecf_enabled) {
@@ -496,14 +510,14 @@ public:
             // OID Frame: No MPDU header
             uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE;
             for (uint16_t i = 0; i < payload_size; i++) {
-                frame[VCDU_OFFSET + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i % 256];
+                frame[VCDU_OFFSET + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i & 0xFF];
             }
         } else {
             // MPDU Idle Frame
             build_mpdu_header(frame, MPDU_OFFSET, MPDU_IDLE_DATA);
             uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
             for (uint16_t i = 0; i < payload_size; i++) {
-                frame[PAYLOAD_OFFSET + i] = OID_FRAME_PATTERN.pattern[i % 256];
+                frame[PAYLOAD_OFFSET + i] = OID_FRAME_PATTERN.pattern[i & 0xFF];
             }
         }
         
@@ -548,15 +562,19 @@ public:
             }
             
             if (randomizer_enabled) {
-                for (int i = 0; i < RS_OUTPUT_SIZE; i++) {
-                    frame[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
+                uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
+                uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
+                for (uint16_t i = 0; i < RS_OUTPUT_SIZE / 4; i++) {
+                    frame_words[i] ^= lut_words[i];
                 }
             }
         } else {
             // Non-RS mode: just copy the frame with randomization if enabled
             if (randomizer_enabled) {
-                for (uint16_t i = ASM_SIZE; i < FRAME_SIZE; i++) {
-                    frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - ASM_SIZE];
+                uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
+                uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
+                for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+                    frame_words[i] ^= lut_words[i];
                 }
             }
         }
@@ -604,64 +622,30 @@ public:
         return (count < PENDING_FRAME_QUEUE_SIZE - 1);
     }
 
-    bool has_data_to_send() const {
-        // Statically simulate the frame generation loop to see if we can safely 
-        // finish the payload without starving mid-packet and pulling 0x00 garbage bytes
-        uint32_t simulated_fifo_count = get_sp_fifo_count();
-        uint32_t simulated_sp_offset = current_sp_offset;
-        uint32_t simulated_sp_size = current_sp_size;
-        bool simulated_is_filler = is_filler;
-        uint32_t fifo_peek_offset = 0;
-
-        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
-        uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
-
-        for (int i = 0; i < payload_size; i++) {
-            if (simulated_sp_offset >= simulated_sp_size) {
-                bool have_user = false;
-                if (simulated_fifo_count >= 6) {
-                    while (simulated_fifo_count >= 6 && 
-                          ((peek_sp_byte(fifo_peek_offset) & 0xF8) != 0x00 || 
-                           (peek_sp_byte(fifo_peek_offset + 2) & 0xC0) != 0xC0 ||
-                           peek_sp_byte(fifo_peek_offset + 4) >= 0x40)) {
-                        simulated_fifo_count--;
-                        fifo_peek_offset++;
-                    }
-                    if (simulated_fifo_count >= 6) {
-                        uint16_t pdl = (peek_sp_byte(fifo_peek_offset + 4) << 8) | peek_sp_byte(fifo_peek_offset + 5);
-                        uint32_t total_len = pdl + 7;
-                        if (simulated_fifo_count >= total_len) {
-                            have_user = true;
-                            simulated_sp_size = total_len;
-                            simulated_sp_offset = 0;
-                            simulated_is_filler = false;
-                        }
-                    }
-                }
-
-                if (!have_user) {
-                    if (i == 0) return false; // Stop! Defer to Idle Generator if frame contains zero user payload
-                    return true; // We can securely finish this frame's remaining buffer size with filler
-                }
+    __attribute__((section(".time_critical.has_data_to_send"))) bool has_data_to_send() const {
+        if (current_sp_offset < current_sp_size) return true; // Actively mid-packet, must finish
+        if (get_sp_fifo_free() == 0) return true; // FIFO is 100% full (emergency flush to unblock USB)
+        
+        uint32_t fifo_count = get_sp_fifo_count();
+        if (fifo_count >= 6) {
+            // Check if the head of the FIFO contains RF garbage that needs to be dropped
+            if ((peek_sp_byte(0) & 0xF8) != 0x00 || (peek_sp_byte(2) & 0xC0) != 0xC0 || peek_sp_byte(4) >= 0x40) {
+                return true; 
             }
-
-            if (!simulated_is_filler) {
-                if (simulated_fifo_count == 0) return false; // Starvation detected! Hand off to Idle Generator
-                simulated_fifo_count--;
-                fifo_peek_offset++;
-            }
-            simulated_sp_offset++;
+            
+            // Valid header. Ensure we have buffered the ENTIRE packet before authorizing generation
+            uint16_t pdl = (peek_sp_byte(4) << 8) | peek_sp_byte(5);
+            if (fifo_count >= (uint32_t)(pdl + 7)) return true;
         }
-        return true; // We have enough data
+        return false; // Not enough data, safe to bypass frame generator and send pre-calculated OID Idle Frames
     }
 
-    bool generate_and_queue_mpdu(uint8_t vcid = VCDU_DEFAULT_VCID) {
+    __attribute__((section(".time_critical.generate_and_queue_mpdu"))) bool generate_and_queue_mpdu(uint8_t vcid = VCDU_DEFAULT_VCID) {
         if (!can_queue_binary_frame()) return false;
 
         uint16_t fhp = 0xFFFF;
         uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
         uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
-        uint8_t payload_buf[1012];
 
         for (int i = 0; i < payload_size; i++) {
             if (current_sp_offset >= current_sp_size) {
@@ -703,12 +687,12 @@ public:
 
             if (is_filler) {
                 if (current_sp_offset < 6) {
-                    payload_buf[i] = filler_header[current_sp_offset];
+                    mpdu_payload_buf[i] = filler_header[current_sp_offset];
                 } else {
-                    payload_buf[i] = 0x00; // Idle payload (all zeros per CCSDS recommendation)
+                    mpdu_payload_buf[i] = 0x00; // Idle payload (all zeros per CCSDS recommendation)
                 }
             } else {
-                payload_buf[i] = pop_sp_byte();
+                mpdu_payload_buf[i] = pop_sp_byte();
             }
             current_sp_offset++;
         }
@@ -724,7 +708,7 @@ public:
         vcdu_frame_count++;
 
         build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, fhp);
-        memcpy(frame + PAYLOAD_OFFSET, payload_buf, payload_size);
+        memcpy(frame + PAYLOAD_OFFSET, mpdu_payload_buf, payload_size);
 
         if (fecf_enabled) {
             uint16_t crc = calculate_fecf(frame + ASM_SIZE, length_to_crc);
@@ -738,34 +722,35 @@ public:
             static const int RS_N = 255;
             
             // Temporary buffer for RS encoding
-            uint8_t temp_rs_buf[FRAME_SIZE];
-            memcpy(temp_rs_buf, frame, FRAME_SIZE);
+            memcpy(mpdu_temp_rs_buf, frame, FRAME_SIZE);
             
             for (int i = 0; i < I; i++) {
                 uint8_t msg[RS_K];
                 uint8_t parity[RS_N - RS_K];
                 for (int c = 0; c < RS_K; c++) {
-                    msg[c] = temp_rs_buf[ASM_SIZE + c * I + i];
+                    msg[c] = mpdu_temp_rs_buf[ASM_SIZE + c * I + i];
                 }
                 rs_encode(msg, parity);
                 for (int c = 0; c < RS_K; c++) {
-                    temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
+                    mpdu_temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
                 }
                 for (int c = 0; c < (RS_N - RS_K); c++) {
-                    temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                    mpdu_temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
                 }
             }
             
             if (dual_basis_enabled) {
-                rs_apply_dual_basis(temp_rs_buf + ASM_SIZE, 1020);
+                rs_apply_dual_basis(mpdu_temp_rs_buf + ASM_SIZE, 1020);
             }
             
-            memcpy(frame, temp_rs_buf, FRAME_SIZE);
+            memcpy(frame, mpdu_temp_rs_buf, FRAME_SIZE);
         }
         
         if (randomizer_enabled) {
-            for (uint16_t i = ASM_SIZE; i < FRAME_SIZE; i++) {
-                frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - ASM_SIZE];
+            uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
+            uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
+            for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+                frame_words[i] ^= lut_words[i];
             }
         }
         
@@ -952,7 +937,7 @@ public:
         prepare_tx_stream();
     }
 
-    bool process_baseband_to_dma() {
+    __attribute__((section(".time_critical.process_baseband_to_dma"))) bool process_baseband_to_dma() {
         if (queue_is_full(&dma_chunk_queue)) return false;
 
         bool is_tracked_frame = true;
@@ -983,48 +968,49 @@ public:
                 static const int RS_N = 255;
                 
                 // Temporary buffer for RS encoding (1024 bytes total)
-                uint8_t temp_rs_buf[1024];
-                memcpy(temp_rs_buf, current_tx_frame, FRAME_SIZE);
+                memcpy(bb_temp_rs_buf, current_tx_frame, FRAME_SIZE);
+
                 
                 // RS encode the frame (interleaved encoding, 4 codewords)
                 for (int i = 0; i < I; i++) {
                     uint8_t msg[RS_K];
                     uint8_t parity[RS_N - RS_K];
                     for (int c = 0; c < RS_K; c++) {
-                        msg[c] = temp_rs_buf[ASM_SIZE + c * I + i];
+                        msg[c] = bb_temp_rs_buf[ASM_SIZE + c * I + i];
                     }
                     rs_encode(msg, parity);
                     for (int c = 0; c < RS_K; c++) {
-                        temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
+                        bb_temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
                     }
                     for (int c = 0; c < (RS_N - RS_K); c++) {
-                        temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                        bb_temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
                     }
                 }
                 
                 if (dual_basis_enabled) {
-                    rs_apply_dual_basis(temp_rs_buf + ASM_SIZE, 1020);
+                    rs_apply_dual_basis(bb_temp_rs_buf + ASM_SIZE, 1020);
                 }
                 
-                memcpy(current_tx_frame, temp_rs_buf, FRAME_SIZE);
+                memcpy(current_tx_frame, bb_temp_rs_buf, FRAME_SIZE);
             }
             
             // Apply randomization if enabled (skips ASM, starts at byte 4)
             if (randomizer_enabled) {
-                for (uint16_t i = ASM_SIZE; i < FRAME_SIZE; i++) {
-                    current_tx_frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - ASM_SIZE];
+                uint32_t *frame_words = (uint32_t*)(current_tx_frame + ASM_SIZE);
+                uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
+                for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+                    frame_words[i] ^= lut_words[i];
                 }
             }
         }
 
-        DmaChunk generation_chunk; // Use stack to prevent Core 0/1 member collisions
         uint32_t words_written = 0;
 
         if (!convolution_enabled) {
             uint32_t* frame_words = (uint32_t*)current_tx_frame;
             for (uint16_t i = 0; i < FRAME_SIZE / 4; i++) {
                 uint32_t word = __builtin_bswap32(frame_words[i]);
-                generation_chunk.words[words_written++] = word;
+            bb_generation_chunk.words[words_written++] = word;
             }
         } else {
             if (conv_rate == 0 && tx_accum_bits == 0) {
@@ -1038,7 +1024,7 @@ public:
                         
                         word = (word << 16) | out_word;
                     }
-                    generation_chunk.words[words_written++] = word;
+                    bb_generation_chunk.words[words_written++] = word;
                 }
             } else {
                 uint32_t accum_data = tx_accum_data;
@@ -1061,7 +1047,7 @@ public:
                             accum_data = (accum_data << 1) | c1;
                             accum_bits++;
                             if (accum_bits == 32) {
-                                generation_chunk.words[words_written++] = accum_data;
+                            bb_generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
                                 accum_data = 0;
                             }
@@ -1070,7 +1056,7 @@ public:
                             accum_data = (accum_data << 1) | c2;
                             accum_bits++;
                             if (accum_bits == 32) {
-                                generation_chunk.words[words_written++] = accum_data;
+                            bb_generation_chunk.words[words_written++] = accum_data;
                                 accum_bits = 0;
                                 accum_data = 0;
                             }
@@ -1084,13 +1070,13 @@ public:
                 punc_phase = p_phase;
             }
         }
-        generation_chunk.length = words_written;
-        generation_chunk.is_user_data = is_tracked_frame ? 1 : 0;
-        queue_try_add(&dma_chunk_queue, &generation_chunk);
+    bb_generation_chunk.length = words_written;
+    bb_generation_chunk.is_user_data = is_tracked_frame ? 1 : 0;
+    queue_try_add(&dma_chunk_queue, &bb_generation_chunk);
         return true;
     }
 
-    __attribute__((section(".time_critical.bpsk"))) uint32_t fill_dma_buffer(uint32_t *out_buf) {
+    __attribute__((section(".time_critical.fill_dma_buffer"))) uint32_t fill_dma_buffer(uint32_t *out_buf) {
         uint32_t total_words = 0;
         // Batch pull up to DMA_BUFFER_MULTIPLIER chunks to give Core 0 massive breathing room
         while (total_words + (FRAME_SIZE / 2) <= (FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER) {
@@ -1117,7 +1103,7 @@ public:
         return total_words;
     }
 
-    __attribute__((section(".time_critical.bpsk"))) void handle_dma_irq() {
+    __attribute__((section(".time_critical.handle_dma_irq"))) void handle_dma_irq() {
         if (!running) {
             // Safely sink phantom interrupts from aborted transfers to prevent memory corruption
             if (dma_channel_get_irq0_status(dma_chan_0)) dma_channel_acknowledge_irq0(dma_chan_0);
@@ -1127,7 +1113,7 @@ public:
         
         if (dma_channel_get_irq0_status(dma_chan_0)) {
             dma_channel_acknowledge_irq0(dma_chan_0);
-            dma_channel_start(dma_chan_1); // Restore software chaining to prevent hardware deadlock
+            dma_channel_start(dma_chan_1); // Software chain
             
             uint32_t len = fill_dma_buffer(dma_buf[0]);
             dma_channel_set_trans_count(dma_chan_0, len, false);
@@ -1135,7 +1121,7 @@ public:
         } 
         else if (dma_channel_get_irq0_status(dma_chan_1)) {
             dma_channel_acknowledge_irq0(dma_chan_1);
-            dma_channel_start(dma_chan_0); // Restore software chaining to prevent hardware deadlock
+            dma_channel_start(dma_chan_0); // Software chain
             
             uint32_t len = fill_dma_buffer(dma_buf[1]);
             dma_channel_set_trans_count(dma_chan_1, len, false);

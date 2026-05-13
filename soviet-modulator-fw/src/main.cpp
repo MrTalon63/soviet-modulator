@@ -254,6 +254,16 @@ void loop() {
 		last_blink = now;
 	}
 
+	// Telemetry Heartbeat during binary streaming
+	static unsigned long last_telemetry = 0;
+	if (binary_upload_mode && (now - last_telemetry >= 1000)) {
+		Serial.print("[MCU] FIFO: ");
+		Serial.print(modulator->get_sp_fifo_count());
+		Serial.print("/131072 | TX Frames: ");
+		Serial.println(modulator->get_pending_frames_count());
+		last_telemetry = now;
+	}
+
 	// Safety Timeout: Escape Binary Mode after 5 seconds of silence.
 	if (binary_upload_mode && !Serial.available()) {
 		if (now - last_binary_rx_ms > 5000) {
