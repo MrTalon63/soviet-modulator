@@ -194,9 +194,42 @@ __attribute__((always_inline)) static inline uint16_t calculate_fecf(const uint8
     return crc;
 }
 
-static uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
-static uint8_t PUNC_C1[] = { 0b1, 0b01, 0b101, 0b10101, 0b1010001 };
-static uint8_t PUNC_C2[] = { 0b1, 0b11, 0b011, 0b01011, 0b0101111 };
+static constexpr uint8_t PUNC_PERIOD[] = { 1, 2, 3, 5, 7 };
+static constexpr uint8_t PUNC_C1[] = { 0b1, 0b01, 0b101, 0b10101, 0b1010001 };
+static constexpr uint8_t PUNC_C2[] = { 0b1, 0b11, 0b011, 0b01011, 0b0101111 };
+
+struct alignas(4) BPSKPunctureFastLut {
+    // table[rate][phase][byte] = (next_phase << 16) | (count << 8) | bits
+    uint32_t table[5][7][256];
+    
+    constexpr BPSKPunctureFastLut() : table{} {
+        for (int rate = 1; rate <= 4; rate++) {
+            uint8_t p_period = PUNC_PERIOD[rate];
+            uint8_t c1_mask = PUNC_C1[rate];
+            uint8_t c2_mask = PUNC_C2[rate];
+            
+            for (int phase = 0; phase < p_period; phase++) {
+                for (int val = 0; val < 256; val++) {
+                    uint8_t accum = 0;
+                    uint8_t count = 0;
+                    uint8_t current_phase = phase;
+                    
+                    for (int s = 3; s >= 0; s--) {
+                        uint8_t c1 = (val >> (s * 2 + 1)) & 1;
+                        uint8_t c2 = (val >> (s * 2)) & 1;
+                        if ((c1_mask >> current_phase) & 1) { accum = (accum << 1) | c1; count++; }
+                        if ((c2_mask >> current_phase) & 1) { accum = (accum << 1) | c2; count++; }
+                        
+                        current_phase++;
+                        if (current_phase >= p_period) current_phase = 0;
+                    }
+                    table[rate][phase][val] = accum | (count << 8) | (current_phase << 16);
+                }
+            }
+        }
+    }
+};
+static BPSKPunctureFastLut CCSDS_PUNC_FAST_LUT;
 
 static const uint16_t bpsk_modulator_program[] = {
     0x6001,
@@ -239,7 +272,8 @@ private:
     bool fecf_enabled;
 
     static constexpr uint32_t SP_FIFO_SIZE = 131072; // 128 KB, MUST be power of 2
-    volatile uint8_t sp_fifo[SP_FIFO_SIZE];
+    volatile uint8_t* sp_fifo;
+    int spi_dma_chan = -1;
     volatile uint32_t sp_fifo_head = 0;
     volatile uint32_t sp_fifo_tail = 0;
 
@@ -265,7 +299,6 @@ private:
 
     alignas(4) uint8_t current_tx_frame[FRAME_SIZE];
     alignas(4) DmaChunk dma_irq_chunk;
-    alignas(4) uint8_t rs_cadu_buffer[FRAME_SIZE];
 
     uint8_t conv_shift_reg;
     alignas(4) uint32_t tx_accum_data;
@@ -279,8 +312,6 @@ private:
 
     // Heap-allocated buffers to prevent Core 1 Stack Overflows (4KB stack limit)
     alignas(4) uint8_t mpdu_payload_buf[1012];
-    alignas(4) uint8_t mpdu_temp_rs_buf[FRAME_SIZE];
-    alignas(4) uint8_t bb_temp_rs_buf[FRAME_SIZE];
     alignas(4) DmaChunk bb_generation_chunk;
 
     volatile uint32_t tx_user_frames_generated = 0;
@@ -318,6 +349,8 @@ private:
 public:
     alignas(4) uint8_t frame[FRAME_SIZE];
     volatile bool config_lock;
+    volatile uint32_t perf_mpdu_us = 0;
+    volatile uint32_t perf_bb_us = 0;
     
     void lock_config() {
         config_lock = true;
@@ -335,7 +368,7 @@ public:
         __dmb();
     }
     
-    BPSKModulator(uint pin, uint32_t rate = 1200) : pin(pin), symbolrate_hz(rate), 
+    BPSKModulator(uint pin, volatile uint8_t* fifo_buf, uint32_t rate = 1200) : pin(pin), sp_fifo(fifo_buf), symbolrate_hz(rate), 
           msg_len(0), msg_pending(false), running(false),
                     convolution_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
                     fecf_enabled(true), conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
@@ -358,8 +391,19 @@ public:
         queue_free(&dma_chunk_queue);
     }
 
+    void set_spi_dma_chan(int chan) {
+        spi_dma_chan = chan;
+    }
+
+    uint32_t get_fifo_head() const {
+        if (spi_dma_chan >= 0) {
+            return (dma_hw->ch[spi_dma_chan].write_addr - (uint32_t)sp_fifo) & (SP_FIFO_SIZE - 1);
+        }
+        return sp_fifo_head;
+    }
+
     uint32_t get_sp_fifo_count() const {
-        uint32_t head = sp_fifo_head;
+        uint32_t head = get_fifo_head();
         __dmb(); // Prevent speculative reads of the FIFO buffer before the head pointer is evaluated
         return (head - sp_fifo_tail) & (SP_FIFO_SIZE - 1);
     }
@@ -370,9 +414,15 @@ public:
 
     bool push_sp_byte(uint8_t b) {
         if (get_sp_fifo_free() == 0) return false;
-        sp_fifo[sp_fifo_head] = b;
+        uint32_t head = get_fifo_head();
+        sp_fifo[head] = b;
         __dmb(); // Force byte to physical RAM before head increments to prevent Core 1 from reading garbage
-        sp_fifo_head = (sp_fifo_head + 1) & (SP_FIFO_SIZE - 1);
+        uint32_t new_head = (head + 1) & (SP_FIFO_SIZE - 1);
+        if (spi_dma_chan >= 0) {
+            dma_hw->ch[spi_dma_chan].al1_write_addr = (uint32_t)sp_fifo + new_head;
+        } else {
+            sp_fifo_head = new_head;
+        }
         return true;
     }
 
@@ -392,6 +442,9 @@ public:
         lock_config();
         sp_fifo_head = 0;
         sp_fifo_tail = 0;
+        if (spi_dma_chan >= 0) {
+            dma_hw->ch[spi_dma_chan].al1_write_addr = (uint32_t)sp_fifo;
+        }
         current_sp_size = 0;
         current_sp_offset = 0;
         is_filler = false;
@@ -529,13 +582,6 @@ public:
         
         // Apply RS encoding if enabled
         if (reed_solomon_enabled) {
-            // RS block: 892 input bytes (VCDU + MPDU + payload) → 1020 output bytes
-            // Copy data to temporary RS buffer for encoding
-            for (int i = 0; i < RS_INPUT_SIZE; i++) {
-                rs_cadu_buffer[ASM_SIZE + i] = frame[ASM_SIZE + i];
-            }
-            
-            // RS encode with I=4 interleaving
             static const int I = 4;
             static const int RS_K = 223;
             static const int RS_N = 255;
@@ -543,19 +589,13 @@ public:
                 uint8_t msg[RS_K];
                 uint8_t parity[RS_N - RS_K];
                 for (int c = 0; c < RS_K; c++) {
-                    msg[c] = rs_cadu_buffer[ASM_SIZE + c * I + i];
+                    msg[c] = frame[ASM_SIZE + c * I + i];
                 }
                 rs_encode(msg, parity);
-                for (int c = 0; c < RS_K; c++) {
-                    rs_cadu_buffer[ASM_SIZE + c * I + i] = msg[c];
-                }
                 for (int c = 0; c < (RS_N - RS_K); c++) {
-                    rs_cadu_buffer[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                    frame[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
                 }
             }
-            
-            // Copy RS output back to frame buffer
-            memcpy(frame + ASM_SIZE, rs_cadu_buffer + ASM_SIZE, RS_OUTPUT_SIZE);
             
             if (dual_basis_enabled) {
                 rs_apply_dual_basis(frame + ASM_SIZE, RS_OUTPUT_SIZE);
@@ -721,29 +761,22 @@ public:
             static const int RS_K = 223;
             static const int RS_N = 255;
             
-            // Temporary buffer for RS encoding
-            memcpy(mpdu_temp_rs_buf, frame, FRAME_SIZE);
-            
             for (int i = 0; i < I; i++) {
                 uint8_t msg[RS_K];
                 uint8_t parity[RS_N - RS_K];
                 for (int c = 0; c < RS_K; c++) {
-                    msg[c] = mpdu_temp_rs_buf[ASM_SIZE + c * I + i];
+                    msg[c] = frame[ASM_SIZE + c * I + i];
                 }
                 rs_encode(msg, parity);
-                for (int c = 0; c < RS_K; c++) {
-                    mpdu_temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
-                }
                 for (int c = 0; c < (RS_N - RS_K); c++) {
-                    mpdu_temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                    frame[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
                 }
             }
             
             if (dual_basis_enabled) {
-                rs_apply_dual_basis(mpdu_temp_rs_buf + ASM_SIZE, 1020);
+                rs_apply_dual_basis(frame + ASM_SIZE, 1020);
             }
             
-            memcpy(frame, mpdu_temp_rs_buf, FRAME_SIZE);
         }
         
         if (randomizer_enabled) {
@@ -967,31 +1000,23 @@ public:
                 static const int RS_K = 223;
                 static const int RS_N = 255;
                 
-                // Temporary buffer for RS encoding (1024 bytes total)
-                memcpy(bb_temp_rs_buf, current_tx_frame, FRAME_SIZE);
-
-                
                 // RS encode the frame (interleaved encoding, 4 codewords)
                 for (int i = 0; i < I; i++) {
                     uint8_t msg[RS_K];
                     uint8_t parity[RS_N - RS_K];
                     for (int c = 0; c < RS_K; c++) {
-                        msg[c] = bb_temp_rs_buf[ASM_SIZE + c * I + i];
+                        msg[c] = current_tx_frame[ASM_SIZE + c * I + i];
                     }
                     rs_encode(msg, parity);
-                    for (int c = 0; c < RS_K; c++) {
-                        bb_temp_rs_buf[ASM_SIZE + c * I + i] = msg[c];
-                    }
                     for (int c = 0; c < (RS_N - RS_K); c++) {
-                        bb_temp_rs_buf[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
+                        current_tx_frame[ASM_SIZE + RS_K * I + c * I + i] = parity[c];
                     }
                 }
                 
                 if (dual_basis_enabled) {
-                    rs_apply_dual_basis(bb_temp_rs_buf + ASM_SIZE, 1020);
+                    rs_apply_dual_basis(current_tx_frame + ASM_SIZE, 1020);
                 }
                 
-                memcpy(current_tx_frame, bb_temp_rs_buf, FRAME_SIZE);
             }
             
             // Apply randomization if enabled (skips ASM, starts at byte 4)
@@ -1027,42 +1052,35 @@ public:
                     bb_generation_chunk.words[words_written++] = word;
                 }
             } else {
-                uint32_t accum_data = tx_accum_data;
+                uint64_t accum_data = tx_accum_data;
                 uint8_t accum_bits = tx_accum_bits;
                 uint8_t p_phase = punc_phase;
-                uint8_t p_period = PUNC_PERIOD[conv_rate];
-                uint8_t c1_mask = PUNC_C1[conv_rate];
-                uint8_t c2_mask = PUNC_C2[conv_rate];
 
                 for (uint16_t i = 0; i < FRAME_SIZE; i++) {
                     uint8_t current_byte = current_tx_frame[i];
                     uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
                     conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
 
-                    for (int b = 7; b >= 0; b--) {
-                        uint8_t c1 = (out_word >> (b * 2 + 1)) & 1;
-                        uint8_t c2 = (out_word >> (b * 2)) & 1;
+                    // Process high byte (first 4 symbols)
+                    uint32_t high_entry = CCSDS_PUNC_FAST_LUT.table[conv_rate][p_phase][out_word >> 8];
+                    accum_data = (accum_data << ((high_entry >> 8) & 0xFF)) | (high_entry & 0xFF);
+                    accum_bits += (high_entry >> 8) & 0xFF;
+                    p_phase = (high_entry >> 16) & 0xFF;
 
-                        if ((c1_mask >> p_phase) & 1) {
-                            accum_data = (accum_data << 1) | c1;
-                            accum_bits++;
-                            if (accum_bits == 32) {
-                            bb_generation_chunk.words[words_written++] = accum_data;
-                                accum_bits = 0;
-                                accum_data = 0;
-                            }
-                        }
-                        if ((c2_mask >> p_phase) & 1) {
-                            accum_data = (accum_data << 1) | c2;
-                            accum_bits++;
-                            if (accum_bits == 32) {
-                            bb_generation_chunk.words[words_written++] = accum_data;
-                                accum_bits = 0;
-                                accum_data = 0;
-                            }
-                        }
-                        p_phase++;
-                        if (p_phase >= p_period) p_phase = 0;
+                    if (accum_bits >= 32) {
+                        bb_generation_chunk.words[words_written++] = (accum_data >> (accum_bits - 32)) & 0xFFFFFFFF;
+                        accum_bits -= 32;
+                    }
+
+                    // Process low byte (next 4 symbols)
+                    uint32_t low_entry = CCSDS_PUNC_FAST_LUT.table[conv_rate][p_phase][out_word & 0xFF];
+                    accum_data = (accum_data << ((low_entry >> 8) & 0xFF)) | (low_entry & 0xFF);
+                    accum_bits += (low_entry >> 8) & 0xFF;
+                    p_phase = (low_entry >> 16) & 0xFF;
+
+                    if (accum_bits >= 32) {
+                        bb_generation_chunk.words[words_written++] = (accum_data >> (accum_bits - 32)) & 0xFFFFFFFF;
+                        accum_bits -= 32;
                     }
                 }
                 tx_accum_data = accum_data;

@@ -1,9 +1,54 @@
 import argparse
 import os
 import sys
+import socket
+import time
 
 
-def process_buffer(buffer, target_apid, out_file, stats):
+class InputSource:
+    def __init__(self, source):
+        self.is_udp = source.startswith("udp://")
+        if self.is_udp:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            host, port = source[6:].split(":")
+            self.sock.bind((host, int(port)))
+            self.f = None
+        else:
+            self.f = open(source, "rb")
+
+    def read_chunk(self):
+        if self.is_udp:
+            return self.sock.recv(65536)
+        else:
+            return self.f.read(65536)
+
+
+class OutputTarget:
+    def __init__(self, dest):
+        self.is_udp = dest.startswith("udp://")
+        if self.is_udp:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            host, port = dest[6:].split(":")
+            self.dest = (host, int(port))
+            self.f = None
+        else:
+            self.f = open(dest, "wb")
+
+    def write(self, data):
+        if self.is_udp:
+            idx = 0
+            while idx < len(data):
+                self.sock.sendto(data[idx : idx + 65000], self.dest)
+                idx += 65000
+        else:
+            self.f.write(data)
+
+    def close(self):
+        if self.f:
+            self.f.close()
+
+
+def process_buffer(buffer, target_apid, out_dest, stats):
     """
     Parses complete Space Packets from the byte buffer.
     Returns the remaining incomplete bytes.
@@ -38,15 +83,15 @@ def process_buffer(buffer, target_apid, out_file, stats):
                     # Sanity limit: only pad if gap is reasonable (prevents infinite files on stream restart)
                     if missing < 500:
                         stats["padded_packets"] += missing
-                        out_file.write(b"\x00" * (missing * len(payload)))
+                        out_dest.write(b"\x00" * (missing * len(payload)))
             else:
                 # First packet received! If it's not seq 0, pad the beginning of the file!
                 if seq > 0 and seq < 500:
                     stats["padded_packets"] += seq
-                    out_file.write(b"\x00" * (seq * len(payload)))
+                    out_dest.write(b"\x00" * (seq * len(payload)))
 
             stats["last_seq"] = seq
-            out_file.write(payload)
+            out_dest.write(payload)
             stats["extracted_bytes"] += len(payload)
             stats["extracted_packets"] += 1
         elif apid == 2047:
@@ -61,9 +106,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract APID payload data from SatDump AOS frames."
     )
-    parser.add_argument("input_file", help="Input binary file from SatDump")
     parser.add_argument(
-        "output_file", help="Output binary file for extracted payload data"
+        "input_source",
+        help="Input binary file from SatDump, or udp://IP:PORT to listen for live streams",
+    )
+    parser.add_argument(
+        "output_dest",
+        help="Output binary file, or udp://IP:PORT to stream extracted payloads",
     )
     parser.add_argument(
         "--apid",
@@ -93,39 +142,13 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.input_file):
-        print(f"Error: Input file '{args.input_file}' not found.")
+    if not args.input_source.startswith("udp://") and not os.path.exists(
+        args.input_source
+    ):
+        print(f"Error: Input file '{args.input_source}' not found.")
         sys.exit(1)
 
     vcdu_size = 1020 if args.no_rs else 892
-
-    # Determine frame boundaries based on format
-    with open(args.input_file, "rb") as f:
-        data = f.read()
-
-    print(f"Loaded {len(data)} bytes. Parsing frames...")
-
-    vcdus = []
-    if args.format == "cadu":
-        asm = b"\x1a\xcf\xfc\x1d"
-        idx = 0
-        while True:
-            idx = data.find(asm, idx)
-            if idx == -1:
-                break
-            if idx + 4 + vcdu_size <= len(data):
-                vcdus.append(data[idx + 4 : idx + 4 + vcdu_size])
-                idx += 4  # Advance just past the ASM so we can seamlessly resynchronize if the SDR drops a byte!
-            else:
-                break
-    else:
-        # Raw VCDUs (SatDump .frames output)
-        for i in range(0, len(data), vcdu_size):
-            chunk = data[i : i + vcdu_size]
-            if len(chunk) == vcdu_size:
-                vcdus.append(chunk)
-
-    print(f"Found {len(vcdus)} valid Transfer Frames.")
 
     stats = {
         "extracted_packets": 0,
@@ -140,81 +163,139 @@ def main():
         "last_seq": None,
     }
 
+    in_src = InputSource(args.input_source)
+    out_dest = OutputTarget(args.output_dest)
+
+    print(f"Listening/Reading from: {args.input_source}")
+    print(f"Writing/Streaming to:   {args.output_dest}")
+    print("Parsing frames...")
+
     last_fc = None
     sync_state = False
-    buffer = bytearray()
+    sp_buffer = bytearray()
+    frame_buffer = bytearray()
+    asm = b"\x1a\xcf\xfc\x1d"
+    search_idx = 0
+    last_print = time.time()
 
-    with open(args.output_file, "wb") as out_f:
-        for vcdu in vcdus:
-            # Parse VCDU Header
-            parsed_vcid = vcdu[1] & 0x3F
-            if parsed_vcid != args.vcid:
-                continue
+    try:
+        while True:
+            chunk = in_src.read_chunk()
+            if not chunk:
+                break  # EOF for files
 
-            frame_count = (vcdu[2] << 16) | (vcdu[3] << 8) | vcdu[4]
+            frame_buffer.extend(chunk)
 
-            # Check continuity
-            if last_fc is not None:
-                if frame_count == last_fc:
-                    # SDR output the same frame twice due to a PLL slip. Ignore it entirely!
-                    stats["duplicated_frames"] += 1
-                    continue
-                if frame_count != (last_fc + 1) & 0xFFFFFF:
-                    # Frame drop detected! Discard corrupted partial packet in buffer
-                    stats["dropped_gaps"] += 1
-                    sync_state = False
-                    if len(buffer) > 0:
-                        stats["fragmented_drops"] += 1
-                    buffer.clear()
-
-            last_fc = frame_count
-
-            # Parse MPDU Header
-            fhp = (vcdu[6] << 8) | vcdu[7]  # Full 16-bit FHP for AOS
-
-            # Packet Zone bounds
-            pz_start = 8
-            pz_end = vcdu_size - (2 if args.fecf else 0)
-            pz_data = vcdu[pz_start:pz_end]
-
-            if fhp == 0xFFFE:
-                # Frame contains only Idle Data
-                continue
-
-            if fhp == 0xFFFF:
-                # No packet starts in this frame. It's a pure continuation of the previous packet.
-                if sync_state:
-                    buffer.extend(pz_data)
-                    buffer = process_buffer(buffer, args.apid, out_f, stats)
-                continue
-
-            if fhp < len(pz_data):
-                # A new packet starts exactly at index 'fhp' within the packet zone!
-                if sync_state:
-                    # Finish assembling the tail of the previous packet
-                    buffer.extend(pz_data[:fhp])
-                    buffer = process_buffer(buffer, args.apid, out_f, stats)
-                    # If there's leftover garbage here, it implies a malformed packet length. Flush it.
-                    if len(buffer) > 0:
-                        stats["fragmented_drops"] += 1
-                        buffer.clear()
+            while True:
+                if args.format == "cadu":
+                    idx = frame_buffer.find(asm, search_idx)
+                    if idx == -1:
+                        if len(frame_buffer) > 3:
+                            frame_buffer = frame_buffer[-3:]
+                        search_idx = 0
+                        break
+                    if len(frame_buffer) >= idx + 4 + vcdu_size:
+                        vcdu = frame_buffer[idx + 4 : idx + 4 + vcdu_size]
+                        search_idx = idx + 4
+                    else:
+                        frame_buffer = frame_buffer[idx:]
+                        search_idx = 0
+                        break
                 else:
-                    # We were out of sync. Discard any stray garbage bytes before locking onto the new header!
-                    buffer.clear()
+                    if len(frame_buffer) >= search_idx + vcdu_size:
+                        vcdu = frame_buffer[search_idx : search_idx + vcdu_size]
+                        search_idx += vcdu_size
+                    else:
+                        frame_buffer = frame_buffer[search_idx:]
+                        search_idx = 0
+                        break
 
-                # We are perfectly locked now!
-                sync_state = True
+                # Parse VCDU Header
+                parsed_vcid = vcdu[1] & 0x3F
+                if parsed_vcid != args.vcid:
+                    continue
 
-                # Start assembling the new packet(s)
-                buffer.extend(pz_data[fhp:])
-                buffer = process_buffer(buffer, args.apid, out_f, stats)
-            else:
-                # FHP is >= payload size. This means the FHP header was corrupted by RF noise!
-                stats["fragmented_drops"] += 1
-                sync_state = False
-                buffer.clear()
+                frame_count = (vcdu[2] << 16) | (vcdu[3] << 8) | vcdu[4]
 
-    print("\nExtraction Complete!")
+                # Check continuity
+                if last_fc is not None:
+                    if frame_count == last_fc:
+                        # SDR output the same frame twice due to a PLL slip. Ignore it entirely!
+                        stats["duplicated_frames"] += 1
+                        continue
+                    if frame_count != (last_fc + 1) & 0xFFFFFF:
+                        # Frame drop detected! Discard corrupted partial packet in buffer
+                        stats["dropped_gaps"] += 1
+                        sync_state = False
+                        if len(sp_buffer) > 0:
+                            stats["fragmented_drops"] += 1
+                        sp_buffer.clear()
+
+                last_fc = frame_count
+
+                # Parse MPDU Header
+                fhp = (vcdu[6] << 8) | vcdu[7]  # Full 16-bit FHP for AOS
+
+                # Packet Zone bounds
+                pz_start = 8
+                pz_end = vcdu_size - (2 if args.fecf else 0)
+                pz_data = vcdu[pz_start:pz_end]
+
+                if fhp == 0xFFFE:
+                    # Frame contains only Idle Data
+                    continue
+
+                if fhp == 0xFFFF:
+                    # No packet starts in this frame. It's a pure continuation of the previous packet.
+                    if sync_state:
+                        sp_buffer.extend(pz_data)
+                        sp_buffer = process_buffer(
+                            sp_buffer, args.apid, out_dest, stats
+                        )
+                    continue
+
+                if fhp < len(pz_data):
+                    # A new packet starts exactly at index 'fhp' within the packet zone!
+                    if sync_state:
+                        # Finish assembling the tail of the previous packet
+                        sp_buffer.extend(pz_data[:fhp])
+                        sp_buffer = process_buffer(
+                            sp_buffer, args.apid, out_dest, stats
+                        )
+                        # If there's leftover garbage here, it implies a malformed packet length. Flush it.
+                        if len(sp_buffer) > 0:
+                            stats["fragmented_drops"] += 1
+                            sp_buffer.clear()
+                    else:
+                        # We were out of sync. Discard any stray garbage bytes before locking onto the new header!
+                        sp_buffer.clear()
+
+                    # We are perfectly locked now!
+                    sync_state = True
+
+                    # Start assembling the new packet(s)
+                    sp_buffer.extend(pz_data[fhp:])
+                    sp_buffer = process_buffer(sp_buffer, args.apid, out_dest, stats)
+                else:
+                    # FHP is >= payload size. This means the FHP header was corrupted by RF noise!
+                    stats["fragmented_drops"] += 1
+                    sync_state = False
+                    sp_buffer.clear()
+
+            now = time.time()
+            if now - last_print > 1.0:
+                sys.stdout.write(
+                    f"\r[Live] Extracted: {stats['extracted_packets']} pkts | Payload: {stats['extracted_bytes'] / 1024:.2f} KB | Drops: {stats['dropped_gaps']}    "
+                )
+                sys.stdout.flush()
+                last_print = now
+
+    except KeyboardInterrupt:
+        print("\nStreaming interrupted by user.")
+    finally:
+        out_dest.close()
+
+    print("\n\nExtraction Complete!")
     print(f"Target APID:       {args.apid}")
     print(f"Target VCID:       {args.vcid}")
     print("---------------------------------")
@@ -231,7 +312,10 @@ def main():
     print(f"Fragmented Drops:  {stats['fragmented_drops']} (Destroyed by gap)")
 
     if stats["extracted_bytes"] > 0:
-        print(f"\nSaved successfully to: {args.output_file}")
+        if args.output_dest.startswith("udp://"):
+            print(f"\nStreamed successfully to: {args.output_dest}")
+        else:
+            print(f"\nSaved successfully to: {args.output_dest}")
     else:
         print("\nWarning: No matching APID payload data was found!")
 

@@ -4,12 +4,39 @@
 #include <si5351.h>
 #include <hardware/watchdog.h>
 #include "pico/util/queue.h"
+#include <hardware/spi.h>
+#include <hardware/irq.h>
+#include <hardware/sync.h>
+#include <hardware/adc.h>
+#include <hardware/vreg.h>
 
 #define MODULATING_PIN 20
 #define LED_PIN 25
 #define INPUT_BUFFER_SIZE 1024
 #define SI5351_SDA_PIN 16
 #define SI5351_SCL_PIN 17
+
+// CH347 SPI definitions
+#define SPI_PORT spi1
+#define SPI_SCK_PIN 10
+#define SPI_TX_PIN 11
+#define SPI_RX_PIN 12
+#define SPI_CS_PIN 13
+
+#ifndef PIN_SMPS_MODE
+#define PIN_SMPS_MODE 23 // Fallback for RP2040 boards if macro is missing
+#endif
+
+#ifndef ADC_CHANNEL_TEMPSENSE
+#if defined(ARDUINO_ARCH_RP2350) || defined(PICO_RP2350)
+#define ADC_CHANNEL_TEMPSENSE 8
+#else
+#define ADC_CHANNEL_TEMPSENSE 4
+#endif
+#endif
+
+alignas(131072) volatile uint8_t global_sp_fifo[131072];
+int spi_rx_dma_chan = -1;
 
 static constexpr uint64_t LO_FREQUENCY_HZ = 144500000ULL;
 static constexpr uint64_t LO_FREQUENCY_01HZ = LO_FREQUENCY_HZ * SI5351_FREQ_MULT;
@@ -103,6 +130,30 @@ void init_si5351_lo() {
 	Serial.println(" MHz on CLK0 at 2 mA drive");
 }
 
+void init_spi_slave() {
+	spi_init(SPI_PORT, 30000000); // 30 MHz maximum
+	spi_set_slave(SPI_PORT, true);
+	spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+	gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
+	gpio_set_function(SPI_TX_PIN, GPIO_FUNC_SPI);
+	gpio_set_function(SPI_RX_PIN, GPIO_FUNC_SPI);
+	gpio_set_function(SPI_CS_PIN, GPIO_FUNC_SPI);
+	gpio_set_inover(SPI_CS_PIN, GPIO_OVERRIDE_LOW); // Force CS internally LOW to ignore the physical wire
+
+	spi_get_hw(SPI_PORT)->dmacr = SPI_SSPDMACR_RXDMAE_BITS; // Enable DMA request generation
+
+	spi_rx_dma_chan = dma_claim_unused_channel(true);
+	dma_channel_config c = dma_channel_get_default_config(spi_rx_dma_chan);
+	channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+	channel_config_set_read_increment(&c, false); // Always read SPI FIFO Address
+	channel_config_set_write_increment(&c, true); // Walk through sp_fifo
+	channel_config_set_ring(&c, true, 17); // 128KB boundary hardware wrapping
+	channel_config_set_dreq(&c, spi_get_dreq(SPI_PORT, false)); // Trigger on RX
+
+	dma_channel_configure(spi_rx_dma_chan, &c, global_sp_fifo, &spi_get_hw(SPI_PORT)->dr, 0xFFFFFFFF, true);
+}
+
 [[noreturn]] void reboot_microcontroller() {
 	Serial.println("Rebooting microcontroller");
 	Serial.flush();
@@ -133,27 +184,38 @@ void print_help() {
 	Serial.println("  O - Output OID pattern (first 10 bytes) for verification");
 	Serial.println("  m - Restart whole microcontroller");
 	Serial.println("  h - Print this help menu");
+	Serial.println("  D - Run hardware SPI pin diagnostic");
 }
 
 void setup() {
+	// Fix coil whine & boot crashes: Force DC/DC into PWM mode BEFORE increasing power draw!
+	pinMode(PIN_SMPS_MODE, OUTPUT);
+	digitalWrite(PIN_SMPS_MODE, HIGH); // Use hardware-agnostic macro (GPIO 23 on Pico 1, mapped internally on Pico 2)
+	delay(10); 
+	
+	vreg_set_voltage(VREG_VOLTAGE_1_30); // Manually set internal core voltage to 1.30V
+	delay(10); // Allow internal LDO to charge up fully
+	set_sys_clock_khz(360000, true); // Safely apply extreme overclock
 	delay(100); // Allow hardware peripherals (Si5351) a fraction of a second to cleanly power up
-	set_sys_clock_khz(250000, true); // Overclock RP2350 to 250 MHz for high-speed stability
 
 	pinMode(LED_PIN, OUTPUT);
 	digitalWrite(LED_PIN, LOW);
-	pinMode(23, OUTPUT);
-	digitalWrite(23, HIGH); // Set pin 23 high so DC/DC isn't fucking shitfest
-	
+
+	adc_init();
+	adc_set_temp_sensor_enabled(true);
+
 	Serial.begin(921600);
 	rs_init(); // Initialize Reed-Solomon tables BEFORE the modulator generates its OID frame!
 	
-	modulator = new BPSKModulator(MODULATING_PIN, 500000);
+	modulator = new BPSKModulator(MODULATING_PIN, global_sp_fifo, 500000);
 	if (modulator == nullptr) {
 		Serial.println("Modulator allocation failed");
 		return;
 	}
 	init_si5351_i2c();
 	init_si5351_lo();
+	init_spi_slave();
+	modulator->set_spi_dma_chan(spi_rx_dma_chan);
 	
 	Serial.println("BPSK Modulator initialized");
 	Serial.println("  Mode: PIO-based (hardware)");
@@ -224,19 +286,20 @@ void loop1() {
 	__dmb(); // Ensure we see the latest config_lock state from Core 0
 	if (modulator->config_lock) return;
 
-	// 1. Pack the pending frame queue with as much MPDU user payload as possible
-	while (modulator->can_queue_binary_frame()) {
-		__dmb();
-		if (modulator->config_lock) break;
-		if (!modulator->has_data_to_send()) break;
+	// 1. Pack ONE frame into the pending queue with as much MPDU user payload as possible.
+	// We use `if` instead of `while` to interleave MPDU generation with DMA chunk generation!
+	// If we batch too many MPDUs at once, the heavy RS encoding will starve the DMA queue!
+	if (modulator->can_queue_binary_frame() && modulator->has_data_to_send()) {
+		uint32_t t0 = time_us_32();
 		modulator->generate_and_queue_mpdu();
+		modulator->perf_mpdu_us = time_us_32() - t0;
 	}
 
-	// 2. Drain baseband queue into DMA chunk queue
-	while (true) {
-		__dmb();
-		if (modulator->config_lock) break;
-		if (!modulator->process_baseband_to_dma()) break; // Break when DMA queue hits 14 chunks
+	// 2. Drain ONE baseband frame into the DMA chunk queue
+	uint32_t t1 = time_us_32();
+	if (modulator->process_baseband_to_dma()) {
+		modulator->perf_bb_us = time_us_32() - t1;
+	} else {
 		delayMicroseconds(50); // Prevent Core 1 from starving the system bus
 	}
 }
@@ -256,17 +319,48 @@ void loop() {
 
 	// Telemetry Heartbeat during binary streaming
 	static unsigned long last_telemetry = 0;
-	if (binary_upload_mode && (now - last_telemetry >= 1000)) {
+	static uint32_t last_dma_write_addr = 0;
+
+	if (binary_upload_mode && (now - last_telemetry >= 100)) { // 10Hz to provide low-latency flow control feedback
+		if (spi_rx_dma_chan >= 0) {
+			uint32_t current_dma_addr = dma_hw->ch[spi_rx_dma_chan].write_addr;
+			if (current_dma_addr != last_dma_write_addr) {
+				last_binary_rx_ms = now; // Prevent timeout watchdog if DMA is actively moving memory
+				last_dma_write_addr = current_dma_addr;
+			}
+		}
+
+		float temp_c = analogReadTemp(); // Arduino-Pico core natively abstracts RP2040 vs RP2350 hw sensors
+
+		uint32_t symbols_per_frame = 8192;
+		if (modulator->get_convolutional_encoding()) {
+			switch (modulator->get_conv_rate()) {
+				case 0: symbols_per_frame = 16384; break;
+				case 1: symbols_per_frame = 12288; break;
+				case 2: symbols_per_frame = 10922; break;
+				case 3: symbols_per_frame = 9830; break;
+				case 4: symbols_per_frame = 9362; break;
+			}
+		}
+		uint32_t frame_tx_time_us = (uint32_t)((symbols_per_frame * 1000000ULL) / modulator->get_symbolrate());
+		uint32_t cpu_time_us = modulator->perf_mpdu_us + modulator->perf_bb_us;
+		float headroom_pct = ((float)(frame_tx_time_us - cpu_time_us) / frame_tx_time_us) * 100.0f;
+
 		Serial.print("[MCU] FIFO: ");
 		Serial.print(modulator->get_sp_fifo_count());
 		Serial.print("/131072 | TX Frames: ");
-		Serial.println(modulator->get_pending_frames_count());
+		Serial.print(modulator->get_pending_frames_count());
+		Serial.print(" | Headroom: ");
+		Serial.print(headroom_pct, 1);
+		Serial.print("% | Temp: ");
+		Serial.print(temp_c, 1);
+		Serial.println("C");
 		last_telemetry = now;
 	}
 
-	// Safety Timeout: Escape Binary Mode after 5 seconds of silence.
+	// Safety Timeout: Escape Binary Mode after 15 seconds of silence.
 	if (binary_upload_mode && !Serial.available()) {
-		if (now - last_binary_rx_ms > 5000) {
+		if (now - last_binary_rx_ms > 15000) {
 			binary_upload_mode = false;
 			Serial.println("\n[MCU] Binary mode timeout/reset! Returning to command mode.");
 		}
@@ -402,7 +496,14 @@ void loop() {
 					break;
 				}
 				case 'q': {
+					float temp_c = analogReadTemp();
 					Serial.println("Modulator status:");
+					Serial.print("  Core Temp: ");
+					Serial.print(temp_c, 1);
+					Serial.println(" C");
+					Serial.print("  Symbol Rate: ");
+					Serial.print(modulator->get_symbolrate());
+					Serial.println(" Hz");
 					Serial.print("  RS (255,223): ");
 					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
 					Serial.print("  Dual Basis: ");
@@ -442,6 +543,27 @@ void loop() {
 					Serial.println(modulator->get_active_user_chunks());
 					Serial.print("  upload active: ");
 					Serial.println(binary_upload_mode ? "YES" : "NO");
+
+					Serial.println("Performance Profiling:");
+					uint32_t symbols_per_frame = 8192;
+					if (modulator->get_convolutional_encoding()) {
+						switch (modulator->get_conv_rate()) {
+							case 0: symbols_per_frame = 16384; break;
+							case 1: symbols_per_frame = 12288; break;
+							case 2: symbols_per_frame = 10922; break;
+							case 3: symbols_per_frame = 9830; break;
+							case 4: symbols_per_frame = 9362; break;
+						}
+					}
+					uint32_t frame_tx_time_us = (uint32_t)((symbols_per_frame * 1000000ULL) / modulator->get_symbolrate());
+					uint32_t cpu_time_us = modulator->perf_mpdu_us + modulator->perf_bb_us;
+					float headroom_pct = ((float)(frame_tx_time_us - cpu_time_us) / frame_tx_time_us) * 100.0f;
+					
+					Serial.print("  MPDU Generation: "); Serial.print(modulator->perf_mpdu_us); Serial.println(" us");
+					Serial.print("  Baseband + DMA:  "); Serial.print(modulator->perf_bb_us); Serial.println(" us");
+					Serial.print("  Total CPU Time:  "); Serial.print(cpu_time_us); Serial.print(" us / "); Serial.print(frame_tx_time_us); Serial.println(" us available");
+					Serial.print("  Core 1 Headroom: "); Serial.print(headroom_pct, 1); Serial.println("%");
+					if (headroom_pct < 0) Serial.println("  [!] WARNING: CPU Too Slow! Pipeline Starvation Occurring!");
 					break;
 				}
 				case 'x': {
@@ -483,6 +605,74 @@ void loop() {
 				}
 				case 'h': {
 					print_help();
+					break;
+				}
+				case 'D': {
+					Serial.println("\n--- ULTIMATE SPI PIN DIAGNOSTIC ---");
+					Serial.println("Please start sending a payload from your PC now...");
+					Serial.println("Listening for high-speed transitions on Pins 10, 11, 12, and 13 for 5 seconds...");
+					
+					// Safely pause DMA
+					dma_channel_abort(spi_rx_dma_chan);
+					
+					gpio_set_function(10, GPIO_FUNC_SIO); gpio_set_dir(10, GPIO_IN);
+					gpio_set_function(11, GPIO_FUNC_SIO); gpio_set_dir(11, GPIO_IN);
+					gpio_set_function(12, GPIO_FUNC_SIO); gpio_set_dir(12, GPIO_IN);
+					gpio_set_function(13, GPIO_FUNC_SIO); gpio_set_dir(13, GPIO_IN);
+					gpio_set_inover(13, GPIO_OVERRIDE_NORMAL); // Temporarily release software override to read physical wire
+					
+					uint32_t t10 = 0, t11 = 0, t12 = 0, t13 = 0;
+					bool l10 = gpio_get(10), l11 = gpio_get(11), l12 = gpio_get(12), l13 = gpio_get(13);
+					uint32_t cs_low_count = 0, total_samples = 0;
+					
+					unsigned long start = millis();
+					while (millis() - start < 5000) {
+						bool c10 = gpio_get(10), c11 = gpio_get(11), c12 = gpio_get(12), c13 = gpio_get(13);
+						if (c10 != l10) t10++;
+						if (c11 != l11) t11++;
+						if (c12 != l12) t12++;
+						if (c13 != l13) t13++;
+						if (!c13) cs_low_count++;
+						total_samples++;
+						l10 = c10; l11 = c11; l12 = c12; l13 = c13;
+					}
+					
+					Serial.print("Transitions on Pin 10 (Expected SCK)  : "); Serial.println(t10);
+					Serial.print("Transitions on Pin 11 (Expected MISO) : "); Serial.println(t11);
+					Serial.print("Transitions on Pin 12 (Expected MOSI) : "); Serial.println(t12);
+					Serial.print("Transitions on Pin 13 (Expected CS)   : "); Serial.println(t13);
+					
+					Serial.print("Pin 13 (CS) was LOW for ");
+					Serial.print((cs_low_count * 100) / (total_samples > 0 ? total_samples : 1));
+					Serial.println("% of the time.");
+
+					if (t10 < 100) {
+						Serial.println("\n[ERROR] No Clock (SCK) signal detected on Pin 10!");
+						Serial.println("        -> The SPI Slave hardware will ignore all data without a clock.");
+					}
+					if (t12 < 100) {
+						Serial.println("\n[ERROR] No Data (MOSI) signal detected on Pin 12!");
+					}
+					if (t13 == 0 && cs_low_count == 0) {
+						Serial.println("\n[ERROR] Chip Select (CS) on Pin 13 is stuck HIGH!");
+						Serial.println("        -> The SPI Slave hardware is DISABLED while CS is HIGH.");
+						Serial.println("        -> Fix: Check CS wiring, or permanently tie Pico Pin 13 to GND.");
+					}
+					
+					if (t10 > 100 && t12 > 100 && (t13 > 0 || cs_low_count > 0)) {
+						Serial.println("\n[SUCCESS] SCK, MOSI, and CS all look electrically healthy!");
+					}
+
+					Serial.println("\nDiagnostic complete. Restoring hardware SPI functions...");
+					
+					gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
+					gpio_set_function(SPI_TX_PIN, GPIO_FUNC_SPI);
+					gpio_set_function(SPI_RX_PIN, GPIO_FUNC_SPI);
+					gpio_set_function(SPI_CS_PIN, GPIO_FUNC_SPI);
+					gpio_set_inover(SPI_CS_PIN, GPIO_OVERRIDE_LOW); // Restore software override
+					
+					dma_channel_start(spi_rx_dma_chan);
+					
 					break;
 				}
 				default:
