@@ -127,12 +127,19 @@ def main():
         "--format",
         choices=["cadu", "vcdu"],
         default="cadu",
-        help="Input format: 'cadu' (1024 bytes with ASM) or 'vcdu' (stripped, default 892 bytes)",
+        help="Input format: 'cadu' (with ASM) or 'vcdu' (stripped)",
+    )
+    parser.add_argument(
+        "--inter",
+        type=int,
+        default=4,
+        choices=[1, 2, 4, 5, 8],
+        help="Reed-Solomon interleave depth (default: 4)",
     )
     parser.add_argument(
         "--no-rs",
         action="store_true",
-        help="Indicate Reed-Solomon was disabled (VCDU size 1020 instead of 892)",
+        help="Indicate Reed-Solomon was disabled (VCDU size uses full payload space)",
     )
     parser.add_argument(
         "--fecf",
@@ -148,7 +155,7 @@ def main():
         print(f"Error: Input file '{args.input_source}' not found.")
         sys.exit(1)
 
-    vcdu_size = 1020 if args.no_rs else 892
+    vcdu_size = (255 * args.inter) if args.no_rs else (223 * args.inter)
 
     stats = {
         "extracted_packets": 0,

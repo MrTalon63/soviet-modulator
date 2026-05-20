@@ -1,9 +1,9 @@
 #include <Arduino.h>
+#include <new>
 #include "bpsk_modulator.h"
 #include <Wire.h>
 #include <si5351.h>
 #include <hardware/watchdog.h>
-#include "pico/util/queue.h"
 #include <hardware/spi.h>
 #include <hardware/irq.h>
 #include <hardware/sync.h>
@@ -35,12 +35,13 @@
 #endif
 #endif
 
-alignas(131072) volatile uint8_t global_sp_fifo[131072];
+alignas(131072) volatile uint8_t global_sp_fifo[131072] __attribute__((section(".uninitialized")));
 int spi_rx_dma_chan = -1;
 
 static constexpr uint64_t LO_FREQUENCY_HZ = 144500000ULL;
 static constexpr uint64_t LO_FREQUENCY_01HZ = LO_FREQUENCY_HZ * SI5351_FREQ_MULT;
 
+alignas(BPSKModulator) static uint8_t modulator_memory[sizeof(BPSKModulator)];
 static BPSKModulator* modulator = nullptr;
 static Si5351 si5351;
 static unsigned long frame_start = 0;
@@ -71,9 +72,9 @@ static unsigned long current_frame_period_ms() {
 			case 3: code_rate = 5.0/6.0; break;
 			case 4: code_rate = 7.0/8.0; break;
 		}
-		output_symbols_per_frame = (uint32_t)((FRAME_SIZE * 8.0) / code_rate);
+		output_symbols_per_frame = (uint32_t)((modulator->get_frame_size() * 8.0) / code_rate);
 	} else {
-		output_symbols_per_frame = FRAME_SIZE * 8U;
+		output_symbols_per_frame = modulator->get_frame_size() * 8U;
 	}
 
 	uint32_t period_ms = (output_symbols_per_frame * 1000U + rate - 1U) / rate;
@@ -93,6 +94,7 @@ Command summary:
 	n - Toggle CCSDS randomizer
 	d - Toggle CCSDS dual basis conversion
 	y - Toggle Reed-Solomon (255,223) I=4 encoding
+	l <count> - Set Reed-Solomon interleaver depth (1, 2, 4, 5, 8)
 	e - Toggle Frame Error Control Field (FECF)
 	q - Print upload/FIFO status
   t <data> - Transmit message (ASCII text)
@@ -174,6 +176,7 @@ void print_help() {
 	Serial.println("  n - Toggle CCSDS randomizer");
 	Serial.println("  d - Toggle CCSDS dual basis conversion");
 	Serial.println("  q - Print upload/FIFO status");
+	Serial.println("  l <count> - Set Reed-Solomon interleaver depth (1, 2, 4, 5, 8)");
 	Serial.println("  t <data> - Transmit message (ASCII text)");
 	Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
 	Serial.println("  e - Toggle Frame Error Control Field (FECF)");
@@ -207,7 +210,7 @@ void setup() {
 	Serial.begin(921600);
 	rs_init(); // Initialize Reed-Solomon tables BEFORE the modulator generates its OID frame!
 	
-	modulator = new BPSKModulator(MODULATING_PIN, global_sp_fifo, 500000);
+	modulator = new (modulator_memory) BPSKModulator(MODULATING_PIN, global_sp_fifo, 500000);
 	if (modulator == nullptr) {
 		Serial.println("Modulator allocation failed");
 		return;
@@ -244,6 +247,15 @@ void process_input(char mode, const char* data) {
 			case 2: Serial.println("3/4"); break;
 			case 3: Serial.println("5/6"); break;
 			case 4: Serial.println("7/8"); break;
+		}
+  	} else if (mode == 'l') {
+		uint8_t interleave = atoi(data);
+		if (interleave == 1 || interleave == 2 || interleave == 4 || interleave == 5 || interleave == 8) {
+			if (modulator != nullptr) modulator->set_rs_interleave(interleave);
+			Serial.print("RS interleave set to: ");
+			Serial.println(interleave);
+		} else {
+			Serial.println("ERROR: RS interleave must be 1, 2, 4, 5, or 8");
 		}
   	} else if (mode == 't') {
 		uint16_t len = strlen(data);
@@ -332,14 +344,14 @@ void loop() {
 
 		float temp_c = analogReadTemp(); // Arduino-Pico core natively abstracts RP2040 vs RP2350 hw sensors
 
-		uint32_t symbols_per_frame = 8192;
+		uint32_t symbols_per_frame = modulator->get_frame_size() * 8;
 		if (modulator->get_convolutional_encoding()) {
 			switch (modulator->get_conv_rate()) {
-				case 0: symbols_per_frame = 16384; break;
-				case 1: symbols_per_frame = 12288; break;
-				case 2: symbols_per_frame = 10922; break;
-				case 3: symbols_per_frame = 9830; break;
-				case 4: symbols_per_frame = 9362; break;
+				case 0: symbols_per_frame = modulator->get_frame_size() * 16; break;
+				case 1: symbols_per_frame = (modulator->get_frame_size() * 8 * 3) / 2; break;
+				case 2: symbols_per_frame = (modulator->get_frame_size() * 8 * 4) / 3; break;
+				case 3: symbols_per_frame = (modulator->get_frame_size() * 8 * 6) / 5; break;
+				case 4: symbols_per_frame = (modulator->get_frame_size() * 8 * 8) / 7; break;
 			}
 		}
 		uint32_t frame_tx_time_us = (uint32_t)((symbols_per_frame * 1000000ULL) / modulator->get_symbolrate());
@@ -460,6 +472,13 @@ void loop() {
 					input_idx = 0;
 					break;
 				}
+				case 'l': {
+					Serial.println("Enter RS interleave depth (1, 2, 4, 5, 8):");
+					waiting_for_input = true;
+					input_mode = 'l';
+					input_idx = 0;
+					break;
+				}
 				case 'n': {
 					bool current = modulator->get_randomizer_enabled();
 					modulator->set_randomizer_enabled(!current);
@@ -504,8 +523,13 @@ void loop() {
 					Serial.print("  Symbol Rate: ");
 					Serial.print(modulator->get_symbolrate());
 					Serial.println(" Hz");
+					Serial.print("  Frame Size: ");
+					Serial.print(modulator->get_frame_size());
+					Serial.println(" bytes");
 					Serial.print("  RS (255,223): ");
 					Serial.println(modulator->get_reed_solomon_enabled() ? "ON" : "OFF");
+					Serial.print("  RS Interleave: ");
+					Serial.println(modulator->get_rs_interleave());
 					Serial.print("  Dual Basis: ");
 					Serial.println(modulator->get_dual_basis_enabled() ? "ON" : "OFF");
 					Serial.print("  FECF (CRC-16): ");
@@ -527,7 +551,7 @@ void loop() {
 					}
 					Serial.println();
 					Serial.print("  Expected Payload: ");
-					uint16_t ep = (modulator->get_reed_solomon_enabled() ? 892 : 1020) - (modulator->get_fecf_enabled() ? 2 : 0) - 8;
+					uint16_t ep = (modulator->get_reed_solomon_enabled() ? modulator->get_rs_input_size() : modulator->get_rs_output_size()) - (modulator->get_fecf_enabled() ? 2 : 0) - 8;
 					Serial.print(ep);
 					Serial.println(" bytes");
 					Serial.println("Space Packet FIFO status:");
@@ -545,14 +569,14 @@ void loop() {
 					Serial.println(binary_upload_mode ? "YES" : "NO");
 
 					Serial.println("Performance Profiling:");
-					uint32_t symbols_per_frame = 8192;
+					uint32_t symbols_per_frame = modulator->get_frame_size() * 8;
 					if (modulator->get_convolutional_encoding()) {
 						switch (modulator->get_conv_rate()) {
-							case 0: symbols_per_frame = 16384; break;
-							case 1: symbols_per_frame = 12288; break;
-							case 2: symbols_per_frame = 10922; break;
-							case 3: symbols_per_frame = 9830; break;
-							case 4: symbols_per_frame = 9362; break;
+							case 0: symbols_per_frame = modulator->get_frame_size() * 16; break;
+							case 1: symbols_per_frame = (modulator->get_frame_size() * 8 * 3) / 2; break;
+							case 2: symbols_per_frame = (modulator->get_frame_size() * 8 * 4) / 3; break;
+							case 3: symbols_per_frame = (modulator->get_frame_size() * 8 * 6) / 5; break;
+							case 4: symbols_per_frame = (modulator->get_frame_size() * 8 * 8) / 7; break;
 						}
 					}
 					uint32_t frame_tx_time_us = (uint32_t)((symbols_per_frame * 1000000ULL) / modulator->get_symbolrate());

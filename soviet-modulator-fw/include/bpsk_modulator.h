@@ -9,12 +9,11 @@
 #include <hardware/pio.h>
 #include <hardware/timer.h>
 #include <hardware/dma.h>
-#include "pico/util/queue.h"
+#include "pico/critical_section.h"
 
 #include "rs.h"
-#define FRAME_SIZE 1024
+#define MAX_FRAME_SIZE 2044
 #define MSG_BUFFER_SIZE 512
-static constexpr uint16_t TX_STREAM_SIZE = FRAME_SIZE * 2;
 static constexpr uint8_t CONV_G1 = 0x79; // 1111001b, 171 octal
 static constexpr uint8_t CONV_G2 = 0x5B; // 1011011b, 133 octal
 
@@ -22,10 +21,6 @@ static constexpr uint8_t CONV_G2 = 0x5B; // 1011011b, 133 octal
 static constexpr uint16_t ASM_SIZE = 4;  // 4-byte Attached Synchronization Marker (not RS encoded)
 static constexpr uint16_t VCDU_HEADER_SIZE = 6;  // 6-byte VCDU header (inside RS block)
 static constexpr uint16_t MPDU_HEADER_SIZE = 2;  // 2-byte MPDU header (inside RS block)
-static constexpr uint16_t RS_PAYLOAD_SIZE = 884;  // 884 bytes payload (inside RS block)
-static constexpr uint16_t RS_INPUT_SIZE = VCDU_HEADER_SIZE + MPDU_HEADER_SIZE + RS_PAYLOAD_SIZE;  // 892 bytes total input to RS
-static constexpr uint16_t RS_OUTPUT_SIZE = 1020;  // RS(255,223) I=4 output size
-static constexpr uint16_t FRAME_DATA_SIZE = ASM_SIZE + RS_OUTPUT_SIZE;  // 1024 total frame size
 static constexpr uint16_t VCDU_OFFSET = ASM_SIZE;  // VCDU starts at byte 4 (inside RS block)
 static constexpr uint16_t MPDU_OFFSET = VCDU_OFFSET + VCDU_HEADER_SIZE;  // MPDU at byte 10 (inside RS block)
 static constexpr uint16_t PAYLOAD_OFFSET = MPDU_OFFSET + MPDU_HEADER_SIZE;  // Payload at byte 12 (inside RS block)
@@ -85,9 +80,9 @@ const int CADU_ASM_SIZE = 4;
 static constexpr uint32_t CADU_ASM = 0x1ACFFC1D;  // CCSDS standard ASM: 0x1A 0xCF 0xFC 0x1D
 
 struct alignas(4) BPSKRandomizerFastLut {
-    uint8_t seq[FRAME_SIZE];
+    uint8_t seq[MAX_FRAME_SIZE];
     constexpr BPSKRandomizerFastLut() : seq{} {
-        for (int i = 0; i < FRAME_SIZE; i++) {
+        for (int i = 0; i < MAX_FRAME_SIZE; i++) {
             seq[i] = RANDOMIZER8_TABLE[i % 255];
         }
     }
@@ -246,6 +241,80 @@ extern BPSKModulator* g_modulator_instance;
 
 extern void bpsk_dma_isr();
 
+template <typename T, size_t SIZE>
+class StaticQueue {
+private:
+    static_assert(sizeof(T) % 4 == 0, "Queue element size must be a multiple of 4 bytes for optimized copying");
+    T data[SIZE];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+    volatile uint16_t count;
+    mutable critical_section_t crit_sec;
+
+public:
+    StaticQueue() : head(0), tail(0), count(0) {
+        critical_section_init(&crit_sec);
+    }
+    
+    ~StaticQueue() {
+        critical_section_deinit(&crit_sec);
+    }
+
+    bool try_add(const T* item) {
+        critical_section_enter_blocking(&crit_sec);
+        if (count >= SIZE) {
+            critical_section_exit(&crit_sec);
+            return false;
+        }
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&data[head]);
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(item);
+        for (size_t i = 0; i < sizeof(T) / 4; i++) {
+            dst[i] = src[i];
+        }
+        head = (head + 1) % SIZE;
+        count++;
+        critical_section_exit(&crit_sec);
+        return true;
+    }
+
+    bool try_remove(T* item) {
+        critical_section_enter_blocking(&crit_sec);
+        if (count == 0) {
+            critical_section_exit(&crit_sec);
+            return false;
+        }
+        uint32_t* dst = reinterpret_cast<uint32_t*>(item);
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(&data[tail]);
+        for (size_t i = 0; i < sizeof(T) / 4; i++) {
+            dst[i] = src[i];
+        }
+        tail = (tail + 1) % SIZE;
+        count--;
+        critical_section_exit(&crit_sec);
+        return true;
+    }
+
+    uint16_t get_level() const {
+        critical_section_enter_blocking(&crit_sec);
+        uint16_t c = count;
+        critical_section_exit(&crit_sec);
+        return c;
+    }
+
+    bool is_full() const {
+        critical_section_enter_blocking(&crit_sec);
+        bool full = (count >= SIZE);
+        critical_section_exit(&crit_sec);
+        return full;
+    }
+    
+    void clear() {
+        critical_section_enter_blocking(&crit_sec);
+        head = tail = count = 0;
+        critical_section_exit(&crit_sec);
+    }
+};
+
 class BPSKModulator
 {
 private:
@@ -257,14 +326,16 @@ private:
     dma_channel_config c0;
     dma_channel_config c1;
     
+    static constexpr uint16_t MAX_DMA_WORDS = 1024;
     static constexpr int DMA_BUFFER_MULTIPLIER = 2;
-    uint32_t dma_buf[2][(FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER];
+    uint32_t dma_buf[2][MAX_DMA_WORDS * DMA_BUFFER_MULTIPLIER];
     
     uint pin;
     uint32_t symbolrate_hz;
     uint16_t msg_len;
     bool msg_pending;
     volatile bool running;
+    uint8_t rs_interleave;
     bool convolution_enabled;
     bool randomizer_enabled;
     bool reed_solomon_enabled;
@@ -287,17 +358,21 @@ private:
     uint32_t vcdu_frame_count;  // Master frame counter (20 bits), reset on transmitter restart
     uint32_t vcdu_vcid_counters[64];  // Per-VCID counter (24 bits each) for 64 possible VCIDs
 
+    struct alignas(4) PendingFrame {
+        uint8_t data[MAX_FRAME_SIZE];
+    };
+
     // Deep enough to absorb math delays, small enough to prevent Out-Of-Memory crashes
-    static constexpr int PENDING_FRAME_QUEUE_SIZE = 32;
-    queue_t pending_frame_queue;
+    static constexpr int PENDING_FRAME_QUEUE_SIZE = 16;
+    StaticQueue<PendingFrame, PENDING_FRAME_QUEUE_SIZE> pending_frame_queue;
 
     struct alignas(4) DmaChunk {
-        uint32_t words[FRAME_SIZE / 2];
+        uint32_t words[MAX_DMA_WORDS];
         uint32_t length; // 32-bit perfectly aligns struct for ARM LDM/STM memory copies
         uint32_t is_user_data; // Tag to differentiate payload chunks from auto-generated OID chunks
     };
 
-    alignas(4) uint8_t current_tx_frame[FRAME_SIZE];
+    alignas(4) uint8_t current_tx_frame[MAX_FRAME_SIZE];
     alignas(4) DmaChunk dma_irq_chunk;
 
     uint8_t conv_shift_reg;
@@ -305,26 +380,24 @@ private:
     uint8_t tx_accum_bits;
     uint8_t punc_phase;
     uint8_t conv_rate;
-    alignas(4) uint8_t oid_frame[FRAME_SIZE];
+    alignas(4) uint8_t oid_frame[MAX_FRAME_SIZE];
 
-    static constexpr int DMA_CHUNK_QUEUE_SIZE = 32;
-    queue_t dma_chunk_queue;
+    static constexpr int DMA_CHUNK_QUEUE_SIZE = 16;
+    StaticQueue<DmaChunk, DMA_CHUNK_QUEUE_SIZE> dma_chunk_queue;
 
     // Heap-allocated buffers to prevent Core 1 Stack Overflows (4KB stack limit)
-    alignas(4) uint8_t mpdu_payload_buf[1012];
+    alignas(4) uint8_t mpdu_payload_buf[MAX_FRAME_SIZE];
     alignas(4) DmaChunk bb_generation_chunk;
 
     volatile uint32_t tx_user_frames_generated = 0;
     volatile uint32_t tx_user_chunks_dma_cleared = 0;
 
     void flush_dma_chunks() {
-        static DmaChunk dummy;
-        while (queue_try_remove(&dma_chunk_queue, &dummy));
+        dma_chunk_queue.clear();
     }
 
     void flush_pending_frames() {
-        static uint8_t dummy[FRAME_SIZE];
-        while (queue_try_remove(&pending_frame_queue, dummy));
+        pending_frame_queue.clear();
     }
 
     void clear_baseband_state() {
@@ -347,7 +420,7 @@ private:
     }
 
 public:
-    alignas(4) uint8_t frame[FRAME_SIZE];
+    alignas(4) uint8_t frame[MAX_FRAME_SIZE];
     volatile bool config_lock;
     volatile uint32_t perf_mpdu_us = 0;
     volatile uint32_t perf_bb_us = 0;
@@ -359,7 +432,7 @@ public:
     }
 
     uint8_t get_dma_chunks_count() const {
-        return queue_get_level(const_cast<queue_t*>(&dma_chunk_queue));
+        return dma_chunk_queue.get_level();
     }
 
     void unlock_config() {
@@ -368,15 +441,25 @@ public:
         __dmb();
     }
     
+    uint16_t get_frame_size() const {
+        return ASM_SIZE + 255 * rs_interleave;
+    }
+    
+    uint16_t get_rs_input_size() const {
+        return 223 * rs_interleave;
+    }
+    
+    uint16_t get_rs_output_size() const {
+        return 255 * rs_interleave;
+    }
+
     BPSKModulator(uint pin, volatile uint8_t* fifo_buf, uint32_t rate = 1200) : pin(pin), sp_fifo(fifo_buf), symbolrate_hz(rate), 
-          msg_len(0), msg_pending(false), running(false),
+          msg_len(0), msg_pending(false), running(false), rs_interleave(4),
                     convolution_enabled(true), randomizer_enabled(true), reed_solomon_enabled(true), dual_basis_enabled(false),
                     fecf_enabled(true), conv_shift_reg(0), tx_accum_data(0), tx_accum_bits(0), punc_phase(0), conv_rate(0),
                     vcdu_frame_count(0),
                     config_lock(false), current_sp_size(0), current_sp_offset(0), is_filler(false), filler_seq(0) {
         g_modulator_instance = this;
-        queue_init(&pending_frame_queue, FRAME_SIZE, PENDING_FRAME_QUEUE_SIZE);
-        queue_init(&dma_chunk_queue, sizeof(DmaChunk), DMA_CHUNK_QUEUE_SIZE);
         memset(vcdu_vcid_counters, 0, sizeof(vcdu_vcid_counters));
         build_oid_frame();
         init_frame();
@@ -387,8 +470,6 @@ public:
         lock_config();
         stop();
         unlock_config();
-        queue_free(&pending_frame_queue);
-        queue_free(&dma_chunk_queue);
     }
 
     void set_spi_dma_chan(int chan) {
@@ -456,7 +537,7 @@ public:
     }
 
     void randomize_frame_data(uint16_t start_index) {
-        for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
+        for (uint16_t i = start_index; i < get_frame_size(); i++) {
             frame[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - start_index];
         }
     }
@@ -506,7 +587,7 @@ public:
 
 
     void randomize_buffer_data(uint8_t *buffer, uint16_t start_index) {
-        for (uint16_t i = start_index; i < FRAME_SIZE; i++) {
+        for (uint16_t i = start_index; i < get_frame_size(); i++) {
             buffer[i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i - start_index];
         }
     }
@@ -528,7 +609,7 @@ public:
         
         // For OID frames (VCID 63), there is NO MPDU header!
         // OID pattern starts immediately after the VCDU header.
-        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t length_to_crc = (reed_solomon_enabled ? get_rs_input_size() : get_rs_output_size()) - (fecf_enabled ? 2 : 0);
         uint16_t oid_payload_size = length_to_crc - VCDU_HEADER_SIZE;
         for (uint16_t i = 0; i < oid_payload_size; i++) {
             oid_frame[ASM_SIZE + VCDU_HEADER_SIZE + i] = OID_FRAME_PATTERN.pattern[i & 0xFF];
@@ -557,7 +638,7 @@ public:
         vcdu_vcid_counters[vcid]++;  // Increment per-VCID counter
         vcdu_frame_count++;  // Increment master frame counter
         
-        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t length_to_crc = (reed_solomon_enabled ? get_rs_input_size() : get_rs_output_size()) - (fecf_enabled ? 2 : 0);
         
         if (vcid == 0x3F) {
             // OID Frame: No MPDU header
@@ -582,7 +663,7 @@ public:
         
         // Apply RS encoding if enabled
         if (reed_solomon_enabled) {
-            static const int I = 4;
+            const int I = rs_interleave;
             static const int RS_K = 223;
             static const int RS_N = 255;
             for (int i = 0; i < I; i++) {
@@ -598,14 +679,18 @@ public:
             }
             
             if (dual_basis_enabled) {
-                rs_apply_dual_basis(frame + ASM_SIZE, RS_OUTPUT_SIZE);
+                rs_apply_dual_basis(frame + ASM_SIZE, get_rs_output_size());
             }
             
             if (randomizer_enabled) {
                 uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
                 uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
-                for (uint16_t i = 0; i < RS_OUTPUT_SIZE / 4; i++) {
+                uint16_t words = get_rs_output_size() / 4;
+                for (uint16_t i = 0; i < words; i++) {
                     frame_words[i] ^= lut_words[i];
+                }
+                for (uint16_t i = words * 4; i < get_rs_output_size(); i++) {
+                    frame[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
                 }
             }
         } else {
@@ -613,19 +698,23 @@ public:
             if (randomizer_enabled) {
                 uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
                 uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
-                for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+                uint16_t words = get_rs_output_size() / 4;
+                for (uint16_t i = 0; i < words; i++) {
                     frame_words[i] ^= lut_words[i];
+                }
+                for (uint16_t i = words * 4; i < get_rs_output_size(); i++) {
+                    frame[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
                 }
             }
         }
     }
 
     uint8_t get_pending_frames_count() const {
-        return queue_get_level(const_cast<queue_t*>(&pending_frame_queue));
+        return pending_frame_queue.get_level();
     }
 
     bool push_pending_frame(const uint8_t* frame_data) {
-        if (queue_try_add(&pending_frame_queue, frame_data)) {
+        if (pending_frame_queue.try_add(reinterpret_cast<const PendingFrame*>(frame_data))) {
             tx_user_frames_generated++; // Track all user-provided data frames
             return true;
         }
@@ -633,7 +722,7 @@ public:
     }
 
     bool pop_pending_frame(uint8_t* frame_data) {
-        return queue_try_remove(&pending_frame_queue, frame_data);
+        return pending_frame_queue.try_remove(reinterpret_cast<PendingFrame*>(frame_data));
     }
 
     uint8_t* get_oid_frame() {
@@ -684,7 +773,7 @@ public:
         if (!can_queue_binary_frame()) return false;
 
         uint16_t fhp = 0xFFFF;
-        uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - (fecf_enabled ? 2 : 0);
+        uint16_t length_to_crc = (reed_solomon_enabled ? get_rs_input_size() : get_rs_output_size()) - (fecf_enabled ? 2 : 0);
         uint16_t payload_size = length_to_crc - VCDU_HEADER_SIZE - MPDU_HEADER_SIZE;
 
         for (int i = 0; i < payload_size; i++) {
@@ -757,7 +846,7 @@ public:
         }
 
         if (reed_solomon_enabled) {
-            static const int I = 4;
+            const int I = rs_interleave;
             static const int RS_K = 223;
             static const int RS_N = 255;
             
@@ -774,7 +863,7 @@ public:
             }
             
             if (dual_basis_enabled) {
-                rs_apply_dual_basis(frame + ASM_SIZE, 1020);
+                rs_apply_dual_basis(frame + ASM_SIZE, get_rs_output_size());
             }
             
         }
@@ -782,8 +871,12 @@ public:
         if (randomizer_enabled) {
             uint32_t *frame_words = (uint32_t*)(frame + ASM_SIZE);
             uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
-            for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+            uint16_t words = get_rs_output_size() / 4;
+            for (uint16_t i = 0; i < words; i++) {
                 frame_words[i] ^= lut_words[i];
+            }
+            for (uint16_t i = words * 4; i < get_rs_output_size(); i++) {
+                frame[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
             }
         }
         
@@ -815,13 +908,31 @@ public:
         bool was_running = running;
         if (was_running) stop();
         
-        memset(frame, 0, FRAME_SIZE);
+        memset(frame, 0, MAX_FRAME_SIZE);
         clear_baseband_state();
         prepare_tx_stream();
         
         if (was_running) start();
         unlock_config();
     }
+
+    void set_rs_interleave(uint8_t i) {
+        if (i != 1 && i != 2 && i != 4 && i != 5 && i != 8) return;
+        if (rs_interleave == i) return;
+        
+        lock_config();
+        bool was_running = running;
+        if (was_running) stop();
+        
+        rs_interleave = i;
+        clear_baseband_state();
+        build_oid_frame();
+        
+        if (was_running) start();
+        unlock_config();
+    }
+
+    uint8_t get_rs_interleave() const { return rs_interleave; }
 
     void set_convolutional_encoding(bool enabled) {
         if (convolution_enabled == enabled) return; // Do not interrupt running stream if unchanged!
@@ -966,19 +1077,19 @@ public:
     }
 
     void init_frame() {
-        memcpy(frame, oid_frame, FRAME_SIZE);
+        memcpy(frame, oid_frame, MAX_FRAME_SIZE);
         prepare_tx_stream();
     }
 
     __attribute__((section(".time_critical.process_baseband_to_dma"))) bool process_baseband_to_dma() {
-        if (queue_is_full(&dma_chunk_queue)) return false;
+        if (dma_chunk_queue.is_full()) return false;
 
         bool is_tracked_frame = true;
         if (!pop_pending_frame(current_tx_frame)) {
             is_tracked_frame = false; // Mark this as an auto-generated Idle chunk
             // Always generate a fresh OID frame when no user data is available (CCSDS compliant idle data)
             // This ensures continuous transmission to prevent Viterbi lock loss
-            memcpy(current_tx_frame, oid_frame, FRAME_SIZE);
+            memcpy(current_tx_frame, oid_frame, MAX_FRAME_SIZE);
             
             // Update VCDU header for OID frame inside RS block (bytes 4-9)
             build_vcdu_header(current_tx_frame, VCDU_OFFSET, 0x3F, vcdu_vcid_counters[0x3F]);
@@ -988,7 +1099,7 @@ public:
             // Note: NO MPDU header update here! VCID 63 does not have one!
             
             if (fecf_enabled) {
-                uint16_t length_to_crc = (reed_solomon_enabled ? RS_INPUT_SIZE : (FRAME_SIZE - ASM_SIZE)) - 2;
+                uint16_t length_to_crc = (reed_solomon_enabled ? get_rs_input_size() : get_rs_output_size()) - 2;
                 uint16_t crc = calculate_fecf(current_tx_frame + ASM_SIZE, length_to_crc);
                 current_tx_frame[ASM_SIZE + length_to_crc] = (crc >> 8) & 0xFF;
                 current_tx_frame[ASM_SIZE + length_to_crc + 1] = crc & 0xFF;
@@ -996,7 +1107,7 @@ public:
             
             // Apply RS encoding and randomization to OID frame if enabled
             if (reed_solomon_enabled) {
-                static const int I = 4;
+                const int I = rs_interleave;
                 static const int RS_K = 223;
                 static const int RS_N = 255;
                 
@@ -1014,7 +1125,7 @@ public:
                 }
                 
                 if (dual_basis_enabled) {
-                    rs_apply_dual_basis(current_tx_frame + ASM_SIZE, 1020);
+                    rs_apply_dual_basis(current_tx_frame + ASM_SIZE, get_rs_output_size());
                 }
                 
             }
@@ -1023,8 +1134,12 @@ public:
             if (randomizer_enabled) {
                 uint32_t *frame_words = (uint32_t*)(current_tx_frame + ASM_SIZE);
                 uint32_t *lut_words = (uint32_t*)(CCSDS_RANDOMIZER_FAST_LUT.seq);
-                for (uint16_t i = 0; i < (FRAME_SIZE - ASM_SIZE) / 4; i++) {
+                uint16_t words = get_rs_output_size() / 4;
+                for (uint16_t i = 0; i < words; i++) {
                     frame_words[i] ^= lut_words[i];
+                }
+                for (uint16_t i = words * 4; i < get_rs_output_size(); i++) {
+                    current_tx_frame[ASM_SIZE + i] ^= CCSDS_RANDOMIZER_FAST_LUT.seq[i];
                 }
             }
         }
@@ -1033,13 +1148,23 @@ public:
 
         if (!convolution_enabled) {
             uint32_t* frame_words = (uint32_t*)current_tx_frame;
-            for (uint16_t i = 0; i < FRAME_SIZE / 4; i++) {
+            for (uint16_t i = 0; i < get_frame_size() / 4; i++) {
                 uint32_t word = __builtin_bswap32(frame_words[i]);
-            bb_generation_chunk.words[words_written++] = word;
+                bb_generation_chunk.words[words_written++] = word;
+            }
+            uint16_t remainder = get_frame_size() % 4;
+            if (remainder > 0) {
+                uint32_t word = 0;
+                uint16_t base = (get_frame_size() / 4) * 4;
+                for (int b = 0; b < remainder; b++) {
+                    word = (word << 8) | current_tx_frame[base + b];
+                }
+                word <<= 8 * (4 - remainder); // pad with 0 to 32 bits
+                bb_generation_chunk.words[words_written++] = word;
             }
         } else {
             if (conv_rate == 0 && tx_accum_bits == 0) {
-                for (uint16_t i = 0; i < FRAME_SIZE; i += 2) {
+                for (uint16_t i = 0; i < get_frame_size() - 1; i += 2) {
                     uint32_t word = 0;
                     for (int b = 0; b < 2; b++) {
                         uint8_t current_byte = current_tx_frame[i + b];
@@ -1051,12 +1176,19 @@ public:
                     }
                     bb_generation_chunk.words[words_written++] = word;
                 }
+                // Handle odd frame size for conv_rate == 0
+                if (get_frame_size() % 2 != 0) {
+                    uint8_t current_byte = current_tx_frame[get_frame_size() - 1];
+                    uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
+                    conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
+                    bb_generation_chunk.words[words_written++] = (uint32_t)out_word << 16;
+                }
             } else {
                 uint64_t accum_data = tx_accum_data;
                 uint8_t accum_bits = tx_accum_bits;
                 uint8_t p_phase = punc_phase;
 
-                for (uint16_t i = 0; i < FRAME_SIZE; i++) {
+                for (uint16_t i = 0; i < get_frame_size(); i++) {
                     uint8_t current_byte = current_tx_frame[i];
                     uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[current_byte] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
                     conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[current_byte];
@@ -1090,15 +1222,15 @@ public:
         }
     bb_generation_chunk.length = words_written;
     bb_generation_chunk.is_user_data = is_tracked_frame ? 1 : 0;
-    queue_try_add(&dma_chunk_queue, &bb_generation_chunk);
+    dma_chunk_queue.try_add(&bb_generation_chunk);
         return true;
     }
 
     __attribute__((section(".time_critical.fill_dma_buffer"))) uint32_t fill_dma_buffer(uint32_t *out_buf) {
         uint32_t total_words = 0;
         // Batch pull up to DMA_BUFFER_MULTIPLIER chunks to give Core 0 massive breathing room
-        while (total_words + (FRAME_SIZE / 2) <= (FRAME_SIZE / 2) * DMA_BUFFER_MULTIPLIER) {
-            if (queue_try_remove(&dma_chunk_queue, &dma_irq_chunk)) {
+        while (total_words + MAX_DMA_WORDS <= MAX_DMA_WORDS * DMA_BUFFER_MULTIPLIER) {
+            if (dma_chunk_queue.try_remove(&dma_irq_chunk)) {
                 if (dma_irq_chunk.is_user_data) {
                     tx_user_chunks_dma_cleared++; // Acknowledge user data successfully hit the RF transmission stage
                 }

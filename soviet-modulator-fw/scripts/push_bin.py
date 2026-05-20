@@ -94,6 +94,9 @@ def main():
         help="Set convolutional puncturing rate (0=1/2, 1=2/3, 2=3/4, 3=5/6, 4=7/8)",
     )
     parser.add_argument(
+        "--inter", type=int, choices=[1, 2, 4, 5, 8], help="Set RS interleave depth"
+    )
+    parser.add_argument(
         "--rs", type=int, choices=[0, 1], help="0=Disable, 1=Enable Reed-Solomon"
     )
     parser.add_argument(
@@ -161,6 +164,7 @@ def main():
         for a in [
             args.rate,
             args.crate,
+            args.inter,
             args.rs,
             args.conv,
             args.rand,
@@ -184,6 +188,12 @@ def main():
             time.sleep(0.1)
             ser.read_all()
 
+        if args.inter is not None:
+            print(f"Setting RS interleave to {args.inter}...")
+            ser.write(f"l{args.inter}\n".encode("utf-8"))
+            time.sleep(0.1)
+            ser.read_all()
+
         if args.rs is not None:
             toggle_if_needed(ser, status, "RS (255,223)", args.rs == 1, "y")
         if args.conv is not None:
@@ -201,6 +211,8 @@ def main():
     print("\n--- Final Modulator Status ---")
     for k in [
         "Symbol Rate",
+        "Frame Size",
+        "RS Interleave",
         "RS (255,223)",
         "FECF (CRC-16)",
         "Convolutional",
@@ -215,19 +227,22 @@ def main():
         sym_rate_str = status.get("Symbol Rate", "1000000 Hz")
         symbol_rate = int(sym_rate_str.split()[0])
 
+        frame_size_str = status.get("Frame Size", "1024 bytes")
+        frame_size = int(frame_size_str.split()[0])
+
         conv_status = status.get("Convolutional", "OFF")
-        symbols_per_frame = 8192
+        symbols_per_frame = frame_size * 8
         if "ON" in conv_status:
             if "1/2" in conv_status:
-                symbols_per_frame = 16384
+                symbols_per_frame = frame_size * 16
             elif "2/3" in conv_status:
-                symbols_per_frame = 12288
+                symbols_per_frame = int(frame_size * 8 * 3 / 2)
             elif "3/4" in conv_status:
-                symbols_per_frame = 10922
+                symbols_per_frame = int(frame_size * 8 * 4 / 3)
             elif "5/6" in conv_status:
-                symbols_per_frame = 9830
+                symbols_per_frame = int(frame_size * 8 * 6 / 5)
             elif "7/8" in conv_status:
-                symbols_per_frame = 9362
+                symbols_per_frame = int(frame_size * 8 * 8 / 7)
 
         frames_per_sec = symbol_rate / symbols_per_frame
 
