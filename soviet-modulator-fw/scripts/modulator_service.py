@@ -82,6 +82,13 @@ def serial_worker(args):
                     if line:
                         text = line.decode("utf-8", errors="ignore").strip()
                         if text.startswith("[MCU]"):
+                            if "FIFO:" in text:
+                                try:
+                                    mcu_fifo_level = int(
+                                        text.split("FIFO: ")[1].split("/")[0]
+                                    )
+                                except ValueError:
+                                    pass
                             sys.stdout.write(
                                 f"\r{text} | High Q: {HIGH_PRIORITY_QUEUE.qsize()} | Normal Q: {NORMAL_PRIORITY_QUEUE.qsize()}    "
                             )
@@ -311,10 +318,15 @@ def serial_worker(args):
 
                 packet = generate_space_packet(apid, seq, payload)
 
-                # For standard USB Serial, we rely entirely on the native CDC hardware backpressure
-                # provided by the Pico's USB endpoint. This is 100% loss-less and perfectly
-                # utilizes the massive 128KB jitter buffer without any telemetry race conditions!
+                # Software flow control: Read CDC telemetry to prevent MCU FIFO overrun
+                # The MCU FIFO is 128KB (131072 bytes), cap flow at 80% (~104000 bytes)
+                while mcu_fifo_level > 104000:
+                    time.sleep(0.01)
+
                 ser.write(packet)
+                mcu_fifo_level += len(
+                    packet
+                )  # Predict level to prevent instantly overfilling
 
                 if priority_tag == "HIGH":
                     HIGH_PRIORITY_QUEUE.task_done()
