@@ -48,6 +48,29 @@ class OutputTarget:
             self.f.close()
 
 
+def generate_crc16_table():
+    table = []
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+        table.append(crc)
+    return table
+
+
+CRC16_TABLE = generate_crc16_table()
+
+
+def calc_crc16(data):
+    crc = 0xFFFF
+    for byte in data:
+        crc = ((crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ byte) & 0xFF]) & 0xFFFF
+    return crc
+
+
 def process_buffer(buffer, target_apid, out_dest, stats):
     """
     Parses complete Space Packets from the byte buffer.
@@ -80,23 +103,15 @@ def process_buffer(buffer, target_apid, out_dest, stats):
                 expected_seq = (stats["last_seq"] + 1) & 0x3FFF
                 if seq != expected_seq:
                     missing = (seq - expected_seq) % 0x4000
-                    # Sanity limit: only pad if gap is reasonable (prevents infinite files on stream restart)
-                    if missing < 500:
-                        stats["padded_packets"] += missing
-                        out_dest.write(b"\x00" * (missing * len(payload)))
-            else:
-                # First packet received! If it's not seq 0, pad the beginning of the file!
-                if seq > 0 and seq < 500:
-                    stats["padded_packets"] += seq
-                    out_dest.write(b"\x00" * (seq * len(payload)))
+                    stats["dropped_gaps"] += missing
 
-            stats["last_seq"] = seq
-            out_dest.write(payload)
-            stats["extracted_bytes"] += len(payload)
-            stats["extracted_packets"] += 1
+                stats["last_seq"] = seq
+                out_dest.write(payload)
+                stats["extracted_packets"] += 1
+                stats["extracted_bytes"] += len(payload)
         elif apid == 2047:
             stats["filler_packets"] += 1
-        else:
+        else:  # Other APIDs
             stats["other_packets"] += 1
 
     return buffer
@@ -142,9 +157,14 @@ def main():
         help="Indicate Reed-Solomon was disabled (VCDU size uses full payload space)",
     )
     parser.add_argument(
-        "--fecf",
+        "--no-fecf",
         action="store_true",
-        help="Indicate Frame Error Control Field (CRC-16) is present at the end of frames",
+        help="Indicate Frame Error Control Field (CRC-16) is NOT present at the end of frames",
+    )
+    parser.add_argument(
+        "--ldpc",
+        action="store_true",
+        help="Indicate CCSDS LDPC (8160, 7136) Rate 7/8 encoding (VCDU size is 892 bytes)",
     )
 
     args = parser.parse_args()
@@ -155,7 +175,10 @@ def main():
         print(f"Error: Input file '{args.input_source}' not found.")
         sys.exit(1)
 
-    vcdu_size = (255 * args.inter) if args.no_rs else (223 * args.inter)
+    if args.ldpc:
+        vcdu_size = 892
+    else:
+        vcdu_size = (255 * args.inter) if args.no_rs else (223 * args.inter)
 
     stats = {
         "extracted_packets": 0,
@@ -164,6 +187,7 @@ def main():
         "other_packets": 0,
         "dropped_gaps": 0,
         "padded_packets": 0,
+        "corrupted_frames": 0,
         "fragmented_drops": 0,
         "duplicated_frames": 0,
         "duplicated_packets": 0,
@@ -217,6 +241,14 @@ def main():
                         search_idx = 0
                         break
 
+                # If FECF is enabled, drop RF-corrupted frames where LDPC failed to converge
+                if not args.no_fecf:
+                    calc_crc = calc_crc16(vcdu[:-2])
+                    frame_crc = (vcdu[-2] << 8) | vcdu[-1]
+                    if calc_crc != frame_crc:
+                        stats["corrupted_frames"] += 1
+                        continue
+
                 # Parse VCDU Header
                 parsed_vcid = vcdu[1] & 0x3F
                 if parsed_vcid != args.vcid:
@@ -245,7 +277,7 @@ def main():
 
                 # Packet Zone bounds
                 pz_start = 8
-                pz_end = vcdu_size - (2 if args.fecf else 0)
+                pz_end = vcdu_size - (0 if args.no_fecf else 2)
                 pz_data = vcdu[pz_start:pz_end]
 
                 if fhp == 0xFFFE:
@@ -292,7 +324,7 @@ def main():
             now = time.time()
             if now - last_print > 1.0:
                 sys.stdout.write(
-                    f"\r[Live] Extracted: {stats['extracted_packets']} pkts | Payload: {stats['extracted_bytes'] / 1024:.2f} KB | Drops: {stats['dropped_gaps']}    "
+                    f"\r[Live] Extracted: {stats['extracted_packets']} pkts | Corrupted RF Frames: {stats['corrupted_frames']} | Drops: {stats['dropped_gaps']}    "
                 )
                 sys.stdout.flush()
                 last_print = now
@@ -309,12 +341,10 @@ def main():
     print(f"Extracted Packets: {stats['extracted_packets']}")
     print(f"Extracted Payload: {stats['extracted_bytes'] / 1024:.2f} KB")
     print(f"Filler Packets:    {stats['filler_packets']} (Discarded)")
-    print(
-        f"Padded Packets:    {stats['padded_packets']} (Zero-filled to preserve image alignment)"
-    )
     print(f"Duplicated Frames: {stats['duplicated_frames']} (Ignored)")
     print(f"Duplicated Pkts:   {stats['duplicated_packets']} (Ignored)")
     print(f"Other APIDs:       {stats['other_packets']} (Ignored)")
+    print(f"RF Corrupted VCDUs:{stats['corrupted_frames']} (Discarded)")
     print(f"Drop Gaps Handled: {stats['dropped_gaps']}")
     print(f"Fragmented Drops:  {stats['fragmented_drops']} (Destroyed by gap)")
 

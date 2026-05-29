@@ -40,6 +40,8 @@ def toggle_if_needed(ser, status, key, desired_state, toggle_cmd):
             ser.write(toggle_cmd.encode("utf-8"))
             time.sleep(0.1)
             ser.read_all()  # clear buffer
+            return True
+    return False
 
 
 def print_progress(bytes_sent, total_size, start_time, mcu_temp=None):
@@ -98,6 +100,9 @@ def main():
     )
     parser.add_argument(
         "--rs", type=int, choices=[0, 1], help="0=Disable, 1=Enable Reed-Solomon"
+    )
+    parser.add_argument(
+        "--ldpc", type=int, choices=[0, 1], help="0=Disable, 1=Enable LDPC (8160, 7136)"
     )
     parser.add_argument(
         "--conv", type=int, choices=[0, 1], help="0=Disable, 1=Enable Convolutional"
@@ -166,6 +171,7 @@ def main():
             args.crate,
             args.inter,
             args.rs,
+            args.ldpc,
             args.conv,
             args.rand,
             args.dual,
@@ -195,15 +201,23 @@ def main():
             ser.read_all()
 
         if args.rs is not None:
-            toggle_if_needed(ser, status, "RS (255,223)", args.rs == 1, "y")
+            if toggle_if_needed(ser, status, "RS (255,223)", args.rs == 1, "y"):
+                status, _ = get_status(ser)
+        if args.ldpc is not None:
+            if toggle_if_needed(ser, status, "LDPC (8160,7136)", args.ldpc == 1, "L"):
+                status, _ = get_status(ser)
         if args.conv is not None:
-            toggle_if_needed(ser, status, "Convolutional", args.conv == 1, "c")
+            if toggle_if_needed(ser, status, "Convolutional", args.conv == 1, "c"):
+                status, _ = get_status(ser)
         if args.rand is not None:
-            toggle_if_needed(ser, status, "Randomizer", args.rand == 1, "n")
+            if toggle_if_needed(ser, status, "Randomizer", args.rand == 1, "n"):
+                status, _ = get_status(ser)
         if args.dual is not None:
-            toggle_if_needed(ser, status, "Dual Basis", args.dual == 1, "d")
+            if toggle_if_needed(ser, status, "Dual Basis", args.dual == 1, "d"):
+                status, _ = get_status(ser)
         if args.fecf is not None:
-            toggle_if_needed(ser, status, "FECF (CRC-16)", args.fecf == 1, "e")
+            if toggle_if_needed(ser, status, "FECF (CRC-16)", args.fecf == 1, "e"):
+                status, _ = get_status(ser)
 
         # Re-fetch status after toggles are applied to get the new Expected Payload
         status, _ = get_status(ser)
@@ -214,6 +228,7 @@ def main():
         "Frame Size",
         "RS Interleave",
         "RS (255,223)",
+        "LDPC (8160,7136)",
         "FECF (CRC-16)",
         "Convolutional",
         "Randomizer",
@@ -259,35 +274,8 @@ def main():
         pass
     print("------------------------------\n")
 
-    # Ensure modulation is started
-    print("Starting modulation...")
-    ser.write(b"s")
-    time.sleep(0.1)
-    ser.read_all()
-
-    # Enter binary upload mode
-    print("Entering binary upload mode and resetting MCU buffers...")
-    ser.write(b"u")
-
-    # Wait securely for the 'B' ready signal
-    ready = False
-    start_wait = time.time()
-    response = b""
-    while time.time() - start_wait < 2.0:
-        response += ser.read_all()
-        if b"B" in response:
-            ready = True
-            break
-        time.sleep(0.05)
-
-    if not ready:
-        print(
-            "Warning: Did not receive 'B' ready signal. Modulator might not be ready."
-        )
-
-    print("Waiting 2.0s for SDR to achieve PLL lock on the idle carrier...")
-    time.sleep(2.0)
-
+    # Initialize CH347 SPI Master BEFORE commanding the MCU into Binary Mode!
+    # This prevents the electrical initialization noise from injecting garbage bytes into the MCU's SPI DMA
     ch347 = None
     if args.spi:
         print("Connecting to CH347 via High-Speed USB and setting up SPI Master...")
@@ -648,6 +636,35 @@ def main():
 
         ch347.spi_tx = _spi_tx
 
+    # Ensure modulation is started
+    print("Starting modulation...")
+    ser.write(b"s")
+    time.sleep(0.1)
+    ser.read_all()
+
+    # Enter binary upload mode
+    print("Entering binary upload mode and resetting MCU buffers...")
+    ser.write(b"u")
+
+    # Wait securely for the 'B' ready signal
+    ready = False
+    start_wait = time.time()
+    response = b""
+    while time.time() - start_wait < 2.0:
+        response += ser.read_all()
+        if b"B" in response:
+            ready = True
+            break
+        time.sleep(0.05)
+
+    if not ready:
+        print(
+            "Warning: Did not receive 'B' ready signal. Modulator might not be ready."
+        )
+
+    print("Waiting 2.0s for SDR to achieve PLL lock on the idle carrier...")
+    time.sleep(2.0)
+
     print(f"Starting upload from {'stdin' if args.file == '-' else args.file}...")
 
     # Read and upload file in chunks
@@ -694,7 +711,9 @@ def main():
                                     mcu_temp = (
                                         line.split("Temp: ")[1].replace("C", "").strip()
                                     )
-                    if mcu_fifo_level < 100000:
+                    if (
+                        mcu_fifo_level < 24000
+                    ):  # Hardware DMA limit is 32768, cap flow at 75%
                         break
                     time.sleep(0.01)
 
