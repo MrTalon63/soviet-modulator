@@ -49,6 +49,8 @@ def main():
     )
     bytes_sent = 0
     start_time = time.time()
+    last_update = start_time - 0.5
+    last_bytes = 0
 
     try:
         while True:
@@ -62,8 +64,12 @@ def main():
             bytes_sent += len(chunk)
 
             now = time.time()
-            if now - start_time > 0:
-                speed_kbps = ((bytes_sent * 8) / (now - start_time)) / 1000
+            if now - last_update >= 0.5:
+                speed_kbps = (
+                    ((bytes_sent - last_bytes) * 8) / (now - last_update)
+                ) / 1000
+                last_bytes = bytes_sent
+                last_update = now
                 if total_size:
                     percent = (bytes_sent / total_size) * 100
                     sys.stdout.write(

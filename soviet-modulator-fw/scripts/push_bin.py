@@ -238,6 +238,7 @@ def main():
         print(f"  {k}: {status.get(k, 'Unknown')}")
 
     # --- Calculate Usable Bandwidth ---
+    target_fifo_level = 24000
     try:
         sym_rate_str = status.get("Symbol Rate", "1000000 Hz")
         symbol_rate = int(sym_rate_str.split()[0])
@@ -267,6 +268,7 @@ def main():
         usable_bytes_per_sec = frames_per_sec * payload_bytes
         usable_kbps = (usable_bytes_per_sec * 8) / 1000
 
+        target_fifo_level = int(max(8192, min(104000, usable_bytes_per_sec * 0.4)))
         print(
             f"  Usable Bandwidth: {usable_kbps:.2f} kbps ({usable_bytes_per_sec/1024:.2f} KB/s)"
         )
@@ -712,8 +714,8 @@ def main():
                                         line.split("Temp: ")[1].replace("C", "").strip()
                                     )
                     if (
-                        mcu_fifo_level < 24000
-                    ):  # Hardware DMA limit is 32768, cap flow at 75%
+                        mcu_fifo_level < target_fifo_level
+                    ):  # Dynamic cap based on data rate to prevent 10Hz telemetry underflow
                         break
                     time.sleep(0.01)
 
@@ -722,24 +724,39 @@ def main():
                     packet
                 )  # Predict level to prevent instantly overfilling
             else:
+                # Software flow control for Serial to prevent OS buffer blocking
+                while True:
+                    if ser.in_waiting:
+                        telemetry_buffer += ser.read_all().decode(
+                            "utf-8", errors="ignore"
+                        )
+                        if "\n" in telemetry_buffer:
+                            lines = telemetry_buffer.split("\n")
+                            telemetry_buffer = lines[-1]
+                            for line in lines[:-1]:
+                                if "[MCU] FIFO:" in line:
+                                    try:
+                                        mcu_fifo_level = int(
+                                            line.split("FIFO: ")[1].split("/")[0]
+                                        )
+                                    except ValueError:
+                                        pass
+                                if "Temp: " in line:
+                                    mcu_temp = (
+                                        line.split("Temp: ")[1].replace("C", "").strip()
+                                    )
+                    if mcu_fifo_level < target_fifo_level:
+                        break
+                    time.sleep(0.01)
+
                 try:
                     ser.write(packet)
+                    mcu_fifo_level += len(packet)
                 except serial.SerialTimeoutException:
                     print(
                         "\n\nError: USB Write Timeout. The MCU stopped receiving data."
                     )
                     sys.exit(1)
-
-                if ser.in_waiting:
-                    telemetry_buffer += ser.read_all().decode("utf-8", errors="ignore")
-                    if "\n" in telemetry_buffer:
-                        lines = telemetry_buffer.split("\n")
-                        telemetry_buffer = lines[-1]
-                        for line in lines[:-1]:
-                            if "Temp: " in line:
-                                mcu_temp = (
-                                    line.split("Temp: ")[1].replace("C", "").strip()
-                                )
 
             bytes_sent += len(chunk)
 

@@ -15,6 +15,7 @@ HIGH_PRIORITY_QUEUE = queue.Queue()
 NORMAL_PRIORITY_QUEUE = queue.Queue()
 mcu_fifo_level = 0
 seq_counters = defaultdict(int)
+TARGET_FIFO_LEVEL = 24000
 
 
 def get_status(ser):
@@ -66,7 +67,7 @@ def generate_space_packet(apid, seq, payload):
 
 def serial_worker(args):
     """Maintains the USB CDC connection and streams from queues to the Modulator."""
-    global mcu_fifo_level
+    global mcu_fifo_level, TARGET_FIFO_LEVEL
     port = args.port
     baud = args.baud
     ser_instance = [None]
@@ -249,6 +250,9 @@ def serial_worker(args):
                 usable_bytes_per_sec = frames_per_sec * payload_bytes
                 usable_kbps = (usable_bytes_per_sec * 8) / 1000
 
+                TARGET_FIFO_LEVEL = int(
+                    max(8192, min(104000, usable_bytes_per_sec * 0.4))
+                )
                 print(
                     f"[Serial]   Usable Bandwidth: {usable_kbps:.2f} kbps ({usable_bytes_per_sec/1024:.2f} KB/s)"
                 )
@@ -310,6 +314,7 @@ def serial_worker(args):
                         keep_alive_seq = (keep_alive_seq + 1) & 0x3FFF
 
                         ser.write(packet)
+                        mcu_fifo_level += len(packet)
                         continue
 
                 # We have a valid user packet - send it with flow control
@@ -318,9 +323,9 @@ def serial_worker(args):
 
                 packet = generate_space_packet(apid, seq, payload)
 
-                # Software flow control: Read CDC telemetry to prevent MCU FIFO overrun
-                # The MCU FIFO is 128KB (131072 bytes), cap flow at 80% (~104000 bytes)
-                while mcu_fifo_level > 104000:
+                # Dynamic Flow Control: ~400ms buffer based on stream speed to perfectly absorb
+                # 100ms telemetry latency without underflow, while keeping responsiveness high
+                while mcu_fifo_level > TARGET_FIFO_LEVEL:
                     time.sleep(0.01)
 
                 ser.write(packet)
@@ -462,8 +467,8 @@ def main():
     parser.add_argument(
         "--qsize",
         type=int,
-        default=50000,
-        help="Max items per priority queue (default 50000, ~50MB at 1KB/item)",
+        default=50,
+        help="Max items per priority queue (default 50, ~50KB at 1KB/item)",
     )
 
     args = parser.parse_args()
