@@ -1,0 +1,16 @@
+.program bpsk_modulator
+.side_set 1
+
+; BPSK Modulator for AD9708 8-bit DAC with 1-bit BCLK
+; BCLK (CLK) on GPIO 0 (side-set pin)
+; bit 7 to 0 of DAC on GPIO 1 to 8 (OUT pins)
+
+.wrap_target
+    out x, 1            side 0  ; Pull 1 bit from OSR, set BCLK low
+    jmp !x, send_zero   side 0  ; If bit is 0, branch to send_zero, BCLK low
+    mov pins, ~null     side 0  ; If bit is 1, set DAC outputs to 0xFF, BCLK low
+    jmp 0               side 1  ; Jump to wrap target (instruction 0), set BCLK high
+send_zero:
+    mov pins, null      side 0  ; If bit is 0, set DAC outputs to 0x00, BCLK low
+    nop                 side 1  ; Wait, set BCLK high (wraps to 0 automatically)
+.wrap
