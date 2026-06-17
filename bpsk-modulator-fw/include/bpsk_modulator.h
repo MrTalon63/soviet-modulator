@@ -10,9 +10,9 @@
 #include <hardware/clocks.h>
 #include <hardware/dma.h>
 #include <hardware/gpio.h>
+#include <hardware/irq.h>
 #include <hardware/pio.h>
 #include <hardware/timer.h>
-#include <hardware/irq.h>
 
 #include "rs.h"
 #define MAX_FRAME_SIZE 2044
@@ -429,10 +429,7 @@ private:
             if (x == 0.0) {
                 h_val = 1.0 - alpha + (4.0 * alpha / pi);
             } else if (fabs(fabs(4.0 * alpha * x) - 1.0) < 1e-9) {
-                h_val = (alpha / sqrt(2.0)) * (
-                    (1.0 + 2.0 / pi) * sin(pi / (4.0 * alpha)) +
-                    (1.0 - 2.0 / pi) * cos(pi / (4.0 * alpha))
-                );
+                h_val = (alpha / sqrt(2.0)) * ((1.0 + 2.0 / pi) * sin(pi / (4.0 * alpha)) + (1.0 - 2.0 / pi) * cos(pi / (4.0 * alpha)));
             } else {
                 double num = sin(pi * x * (1.0 - alpha)) + 4.0 * alpha * x * cos(pi * x * (1.0 + alpha));
                 double den = pi * x * (1.0 - (4.0 * alpha * x) * (4.0 * alpha * x));
@@ -461,19 +458,25 @@ private:
         }
 
         uint32_t rate = symbolrate_hz;
-        if (rate == 0) rate = 1;
-        
+        if (rate == 0)
+            rate = 1;
+
         uint32_t num_states = 1 << rrc_filter_span;
         uint32_t max_L = 131072 / num_states;
-        if (max_L > 4096) max_L = 4096;
-        if (max_L < 4) max_L = 4;
+        if (max_L > 4096)
+            max_L = 4096;
+        if (max_L < 4)
+            max_L = 4;
 
-        rrc_L = (rrc_min_dac_rate + rate - 1) / rate;
-        if (rrc_L < 2) rrc_L = 2;
-        if (rrc_L > max_L) rrc_L = max_L;
-        
+        rrc_L = (rrc_L + 3) & ~3;
+
+        if (rrc_L < 4)
+            rrc_L = 4;
+        if (rrc_L > max_L)
+            rrc_L = max_L & ~3;
+
         uint32_t lut_size = num_states * rrc_L;
-        
+
         rrc_lut = (uint8_t *)malloc(lut_size);
         if (rrc_lut == nullptr) {
             Serial.println("ERROR: Failed to allocate memory for RRC LUT");
@@ -516,21 +519,23 @@ private:
                     double symbol = bit ? 1.0 : -1.0;
                     val += symbol * coeff[j];
                 }
-                
+
                 int dac_val = (int)round(128.0 + scale * val);
-                if (dac_val < 0) dac_val = 0;
-                if (dac_val > 255) dac_val = 255;
-                
+                if (dac_val < 0)
+                    dac_val = 0;
+                if (dac_val > 255)
+                    dac_val = 255;
+
                 // Bit-reverse because GP1 is connected to D7 (MSB) and GP8 to D0 (LSB)
                 uint8_t reversed_val = (uint8_t)dac_val;
                 reversed_val = ((reversed_val & 0xF0) >> 4) | ((reversed_val & 0x0F) << 4);
                 reversed_val = ((reversed_val & 0xCC) >> 2) | ((reversed_val & 0x33) << 2);
                 reversed_val = ((reversed_val & 0xAA) >> 1) | ((reversed_val & 0x55) << 1);
-                
+
                 rrc_lut[state * rrc_L + i] = reversed_val;
             }
         }
-        
+
         Serial.print("RRC/RC LUT precomputed: Alpha=");
         Serial.print(rrc_alpha);
         Serial.print(", Span=");
@@ -555,10 +560,10 @@ private:
         dest[1] = BYTE_EXPAND_LUT.nib[(raw_word >> 24) & 0xFF][1];
         dest[2] = BYTE_EXPAND_LUT.nib[(raw_word >> 16) & 0xFF][0];
         dest[3] = BYTE_EXPAND_LUT.nib[(raw_word >> 16) & 0xFF][1];
-        dest[4] = BYTE_EXPAND_LUT.nib[(raw_word >>  8) & 0xFF][0];
-        dest[5] = BYTE_EXPAND_LUT.nib[(raw_word >>  8) & 0xFF][1];
-        dest[6] = BYTE_EXPAND_LUT.nib[ raw_word        & 0xFF][0];
-        dest[7] = BYTE_EXPAND_LUT.nib[ raw_word        & 0xFF][1];
+        dest[4] = BYTE_EXPAND_LUT.nib[(raw_word >> 8) & 0xFF][0];
+        dest[5] = BYTE_EXPAND_LUT.nib[(raw_word >> 8) & 0xFF][1];
+        dest[6] = BYTE_EXPAND_LUT.nib[raw_word & 0xFF][0];
+        dest[7] = BYTE_EXPAND_LUT.nib[raw_word & 0xFF][1];
     }
 
     void flush_pending_frames() { pending_frame_queue.clear(); }
@@ -597,7 +602,8 @@ public:
     void update_rrc_config(bool enabled, float alpha, uint8_t span, uint32_t min_dac_rate, bool use_rrc_filter) {
         lock_config();
         bool was_running = running;
-        if (was_running) stop();
+        if (was_running)
+            stop();
 
         rrc_enabled = enabled;
         rrc_alpha = alpha;
@@ -616,7 +622,8 @@ public:
 
         clear_baseband_state();
 
-        if (was_running) start();
+        if (was_running)
+            start();
         unlock_config();
     }
 
@@ -628,9 +635,9 @@ public:
 
     void lock_config() {
         config_lock = true;
-        __dmb();  // Force memory controller to instantly broadcast lock state to Core 1
+        __dmb(); // Force memory controller to instantly broadcast lock state to Core 1
         while (core1_processing) {
-            __asm volatile ("nop");
+            __asm volatile("nop");
         }
     }
 
@@ -1526,7 +1533,8 @@ public:
         Serial.print("  underflow_buf[0-3]: ");
         for (int i = 0; i < 4; i++) {
             Serial.print(underflow_buf[i], HEX);
-            if (i < 3) Serial.print(" ");
+            if (i < 3)
+                Serial.print(" ");
         }
         Serial.println();
     }
@@ -1565,7 +1573,7 @@ public:
                     for (int bit = 7; bit >= 0; bit--) {
                         uint8_t symbol = (b >> bit) & 1;
                         rrc_history = ((rrc_history << 1) | symbol) & mask;
-                        
+
                         if (bytes_written + L > max_bytes) {
                             while (bytes_written % 4 != 0) {
                                 dest[bytes_written++] = 0x80;
@@ -1574,7 +1582,7 @@ public:
                             chunk->is_user_data = chunk_is_user;
                             __dmb();
                             dma_ring_head = (h + 1) % DMA_RING_SIZE;
-                            
+
                             h = (h + 1) % DMA_RING_SIZE;
                             while (true) {
                                 uint16_t tail = dma_ring_tail;
@@ -1591,7 +1599,7 @@ public:
                             dest = (uint8_t *)chunk->words;
                             bytes_written = 0;
                         }
-                        
+
                         memcpy(dest + bytes_written, rrc_lut + (rrc_history * L), L);
                         bytes_written += L;
                     }
@@ -1612,7 +1620,7 @@ public:
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
                                 dma_ring_head = (h + 1) % DMA_RING_SIZE;
-                                
+
                                 h = (h + 1) % DMA_RING_SIZE;
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
@@ -1650,7 +1658,7 @@ public:
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
                                 dma_ring_head = (h + 1) % DMA_RING_SIZE;
-                                
+
                                 h = (h + 1) % DMA_RING_SIZE;
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
@@ -1688,7 +1696,7 @@ public:
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
                                 dma_ring_head = (h + 1) % DMA_RING_SIZE;
-                                
+
                                 h = (h + 1) % DMA_RING_SIZE;
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
@@ -1738,7 +1746,28 @@ public:
                     uint32_t raw_word = (uint32_t)(accum_data >> accum_bits);
                     write_expanded_word(&chunk->words[words_written], raw_word);
                     words_written += 8;
-                    accum_data &= (1ULL << accum_bits) - 1; // Mask to prevent overflow on next shift
+                    accum_data &= (1ULL << accum_bits) - 1;
+
+                    if (words_written >= MAX_DMA_WORDS) {
+                        chunk->length = words_written;
+                        chunk->is_user_data = chunk_is_user;
+                        __dmb();
+                        dma_ring_head = (h + 1) % DMA_RING_SIZE;
+                        h = (h + 1) % DMA_RING_SIZE;
+                        while (true) {
+                            uint16_t tail = dma_ring_tail;
+                            uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
+                            if (active < DMA_RING_SIZE - 1) {
+                                break;
+                            }
+                            if (!running || config_lock) {
+                                return false;
+                            }
+                            delayMicroseconds(10);
+                        }
+                        chunk = &dma_ring[h];
+                        words_written = 0;
+                    }
                 }
             }
 
@@ -1778,7 +1807,28 @@ public:
                     uint32_t raw_word = (uint32_t)(accum_data >> accum_bits);
                     write_expanded_word(&chunk->words[words_written], raw_word);
                     words_written += 8;
-                    accum_data &= (1ULL << accum_bits) - 1; // Mask to prevent overflow on next shift
+                    accum_data &= (1ULL << accum_bits) - 1;
+
+                    if (words_written >= MAX_DMA_WORDS) {
+                        chunk->length = words_written;
+                        chunk->is_user_data = chunk_is_user;
+                        __dmb();
+                        dma_ring_head = (h + 1) % DMA_RING_SIZE;
+                        h = (h + 1) % DMA_RING_SIZE;
+                        while (true) {
+                            uint16_t tail = dma_ring_tail;
+                            uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
+                            if (active < DMA_RING_SIZE - 1) {
+                                break;
+                            }
+                            if (!running || config_lock) {
+                                return false;
+                            }
+                            delayMicroseconds(10);
+                        }
+                        chunk = &dma_ring[h];
+                        words_written = 0;
+                    }
                 }
             }
 
@@ -1839,7 +1889,7 @@ public:
         // If neither channel is busy, the hardware ping-pong chain has completely halted (e.g., due to ISR latency).
         // We must jump-start the channel we JUST re-armed to guarantee immediate recovery!
         if (!dma_channel_is_busy(dma_chan_0) && !dma_channel_is_busy(dma_chan_1)) {
-        if (ch0_fired)
+            if (ch0_fired)
                 dma_channel_start(dma_chan_0);
             else if (ch1_fired)
                 dma_channel_start(dma_chan_1);
@@ -1851,7 +1901,7 @@ public:
         pio_offset = pio_add_program(pio, &bpsk_modulator_program_default);
         sm = pio_claim_unused_sm(pio, true);
         pio_sm_config c = pio_get_default_sm_config();
-        
+
         // GPIO 0: BCLK (1-bit side-set)
         // GPIO 1-8: DAC Data (8-bit OUT)
         sm_config_set_out_pins(&c, 1, 8);
@@ -1949,7 +1999,7 @@ public:
         running = false; // Instantly prevent the ISR from processing new chunks
         __dmb();
         while (core1_processing) {
-            __asm volatile ("nop");
+            __asm volatile("nop");
         }
 
         // Disable IRQs so the ISR doesn't re-arm the channels during abort
@@ -1961,7 +2011,7 @@ public:
 
         // Wait for both DMA channels to completely finish aborting
         while (dma_channel_is_busy(dma_chan_0) || dma_channel_is_busy(dma_chan_1)) {
-            __asm volatile ("nop");
+            __asm volatile("nop");
         }
 
         pio_sm_set_enabled(pio, sm, false);
