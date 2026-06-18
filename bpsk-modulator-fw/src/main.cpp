@@ -146,7 +146,7 @@ Command summary:
     c - Toggle CCSDS convolutional encoding
     n - Toggle CCSDS randomizer
     y - Toggle Reed-Solomon (255,223) I=4 encoding
-    L - Toggle CCSDS LDPC (8176, 7154) Rate 7/8 encoding
+    L - Toggle CCSDS LDPC (8160, 7136) Rate 7/8 encoding
     l <count> - Set Reed-Solomon interleaver depth (1, 2, 4, 5, 8)
     e - Toggle Frame Error Control Field (FECF)
     q - Print upload/FIFO status
@@ -168,7 +168,27 @@ void init_si5351_i2c() {
 void apply_si5351_lo() {
     // Apply the currently active lo_freq_hz + correction to the hardware
     si5351.set_correction(lo_correction, SI5351_PLL_INPUT_XO);
-    si5351.set_freq(lo_freq_hz * SI5351_FREQ_MULT, SI5351_CLK0);
+
+    // Switch to Integer Mode for lowest jitter and phase noise
+    uint64_t freq = lo_freq_hz * SI5351_FREQ_MULT;
+    uint64_t ms_freq = freq;
+
+    // Find the internal multisynth frequency (after R-divider)
+    while (ms_freq < SI5351_CLKOUT_MIN_FREQ * SI5351_FREQ_MULT) {
+        ms_freq *= 2;
+    }
+
+    // Calculate an even integer Multisynth divider that keeps the PLL within 600-900 MHz
+    uint32_t ms_div = (900000000ULL * SI5351_FREQ_MULT) / ms_freq;
+    if (ms_div % 2 != 0)
+        ms_div--;
+    if (ms_div < 4)
+        ms_div = 4;
+
+    uint64_t pll_freq = ms_freq * ms_div;
+    si5351.set_freq_manual(freq, pll_freq, SI5351_CLK0);
+    si5351.set_int(SI5351_CLK0, 1);
+
     Serial.print("Si5351 LO: ");
     Serial.print((uint32_t)(lo_freq_hz / 1000000ULL));
     Serial.print(".");
@@ -231,6 +251,7 @@ void print_help() {
     Serial.println("  y - Toggle Reed-Solomon (255,223) I=4 encoding");
     Serial.println("  L - Toggle CCSDS LDPC (8160, 7136) Rate 7/8 encoding");
     Serial.println("  e - Toggle Frame Error Control Field (FECF)");
+    Serial.println("  F - Set FPGA fixed interpolation factor (0=Auto, 4, 8, 12...)");
     Serial.println("  u - Binary upload mode (raw Space Packets, timeout 5s exits)");
     Serial.println("  x - Reinitialize Si5351 LO from saved calibration");
     Serial.println("  f <hz> - Set Si5351 LO frequency in Hz (e.g. 144500000)");
@@ -256,7 +277,7 @@ void setup() {
     delay(10);
 
     vreg_disable_voltage_limit();        // Unlock higher voltages for the RP2350
-    vreg_set_voltage(VREG_VOLTAGE_1_30); // Manually set internal core voltage to 1.30V to stabilize 400 MHz
+    vreg_set_voltage(VREG_VOLTAGE_1_40); // Manually set internal core voltage to 1.30V to stabilize 400 MHz
     delay(100);                          // Allow internal LDO to charge up fully
     set_sys_clock_khz(400000, true);     // Safely apply 400 MHz overclock
     delay(100);                          // Allow hardware peripherals (Si5351) a fraction of a second to cleanly power up
@@ -355,6 +376,16 @@ void process_input(char mode, const char *data) {
             Serial.print("Idle data frame queued with VCID=");
             Serial.println(vcid);
         }
+    } else if (mode == 'F') {
+        uint32_t L = atol(data);
+        if (modulator != nullptr) {
+            modulator->set_rrc_fixed_L(L);
+            Serial.print("FPGA Mode fixed interpolation factor set to: ");
+            if (modulator->get_rrc_fixed_L() == 0)
+                Serial.println("Auto (Disabled)");
+            else
+                Serial.println(modulator->get_rrc_fixed_L());
+        }
     } else if (mode == 'R') {
         float alpha = 0.35f;
         uint32_t min_dac_rate = 20000000;
@@ -385,7 +416,7 @@ void process_input(char mode, const char *data) {
         } else {
             Serial.println("ERROR: Invalid format. Expected space-separated parameters.");
         }
-    } else if (mode == 'f') {
+    } else if (mode == 'O') {
         uint64_t hz = (uint64_t)strtoul(data, nullptr, 10);
         if (hz < 1000000ULL || hz > 200000000ULL) {
             Serial.println("ERROR: Frequency must be 1-200 MHz");
@@ -409,6 +440,7 @@ void setup1() {
     while (modulator == nullptr) {
         delay(10);
     }
+    modulator->enable_dma_irq_core1();
 }
 
 void __not_in_flash_func(loop1)() {
@@ -492,9 +524,14 @@ void loop() {
     // Telemetry Heartbeat during binary streaming
     static unsigned long last_telemetry = 0;
 
-    if (!pin_test_mode && binary_upload_mode && (now - last_telemetry >= 100)) { // 10Hz to provide low-latency flow control feedback
+    if (!pin_test_mode && binary_upload_mode && (now - last_telemetry >= 200)) { // 5Hz to provide flow control feedback with minimal overhead
 
-        float temp_c = analogReadTemp(); // Arduino-Pico core natively abstracts RP2040 vs RP2350 hw sensors
+        static float cached_temp = 0.0f;
+        static unsigned long last_temp_read = 0;
+        if (now - last_temp_read >= 5000 || cached_temp == 0.0f) {
+            cached_temp = analogReadTemp(); // Caching temperature read to avoid frequent synchronous ADC blocks
+            last_temp_read = now;
+        }
 
         uint32_t symbols_per_frame = modulator->get_frame_size() * 8;
         if (modulator->get_convolutional_encoding()) {
@@ -531,7 +568,7 @@ void loop() {
         Serial.print("% | Underflows: ");
         Serial.print(modulator->get_dma_underflows());
         Serial.print(" | Temp: ");
-        Serial.print(temp_c, 1);
+        Serial.print(cached_temp, 1);
         Serial.println("C");
         last_telemetry = now;
     }
@@ -604,8 +641,18 @@ void loop() {
                 modulator->start();
                 modulator->unlock_config();
                 Serial.println("Modulation started");
-                Serial.print("SM: ");
-                Serial.println(modulator->get_sm());
+                Serial.print("  Current L factor: ");
+                Serial.println(modulator->get_rrc_L());
+                Serial.print("  FPGA Fixed Mode: ");
+                if (modulator->get_rrc_fixed_L() > 0)
+                    Serial.println(modulator->get_rrc_fixed_L());
+                else
+                    Serial.println("Auto");
+                Serial.print("  LO Freq: ");
+                Serial.print((uint32_t)(lo_freq_hz / 1000000ULL));
+                Serial.print(".");
+                Serial.print((uint32_t)(lo_freq_hz % 1000000ULL));
+                Serial.println(" MHz");
                 Serial.print("FIFO state - empty: ");
                 Serial.print(modulator->tx_fifo_empty());
                 Serial.print(", full: ");
@@ -687,6 +734,13 @@ void loop() {
                 Serial.println("Enter message:");
                 waiting_for_input = true;
                 input_mode = 't';
+                input_idx = 0;
+                break;
+            }
+            case 'F': {
+                Serial.println("Enter FPGA fixed interpolation factor L (0=Auto, 4, 8, 12...):");
+                waiting_for_input = true;
+                input_mode = 'F';
                 input_idx = 0;
                 break;
             }

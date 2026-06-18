@@ -375,6 +375,9 @@ private:
     uint32_t vcdu_frame_count;       // Master frame counter (20 bits), reset on transmitter restart
     uint32_t vcdu_vcid_counters[64]; // Per-VCID counter (24 bits each) for 64 possible VCIDs
 
+    uint32_t tx_chunk_words_written = 0;
+    uint32_t rrc_chunk_bytes_written = 0;
+
     struct alignas(4) PendingFrame {
         uint8_t data[MAX_FRAME_SIZE];
     };
@@ -400,7 +403,7 @@ private:
     uint8_t conv_rate;
     alignas(4) uint8_t oid_frame[MAX_FRAME_SIZE];
 
-    static constexpr int DMA_RING_SIZE = 4;
+    static constexpr int DMA_RING_SIZE = 8;
     DmaChunk dma_ring[DMA_RING_SIZE];
     volatile uint16_t dma_ring_head;
     volatile uint16_t dma_ring_tail;
@@ -416,6 +419,7 @@ private:
     float rrc_alpha = 0.35f;
     uint8_t rrc_filter_span = 8;          // N_sym (default 8 symbols)
     uint32_t rrc_min_dac_rate = 20000000; // default 20 MHz
+    uint32_t rrc_fixed_L = 0; // 0 = automatic based on min_dac_rate
     uint32_t rrc_L = 8;                   // Calculated oversampling factor L
     bool use_rrc = true;                  // true = RRC, false = RC (Raised Cosine)
     uint8_t *rrc_lut = nullptr;           // Precomputed state LUT: size = (1 << rrc_filter_span) * rrc_L
@@ -460,6 +464,12 @@ private:
         uint32_t rate = symbolrate_hz;
         if (rate == 0)
             rate = 1;
+
+        if (rrc_fixed_L > 0) {
+            rrc_L = rrc_fixed_L;
+        } else {
+            rrc_L = (rrc_min_dac_rate + rate - 1) / rate;
+        }
 
         uint32_t num_states = 1 << rrc_filter_span;
         uint32_t max_L = 131072 / num_states;
@@ -586,6 +596,9 @@ private:
         dma_ring_head = 0;
         dma_ring_tail = 0;
 
+        tx_chunk_words_written = 0;
+        rrc_chunk_bytes_written = 0;
+
         rrc_history = 0;
         flush_pending_frames();
     }
@@ -595,9 +608,26 @@ public:
     float get_rrc_alpha() const { return rrc_alpha; }
     uint8_t get_rrc_filter_span() const { return rrc_filter_span; }
     uint32_t get_rrc_min_dac_rate() const { return rrc_min_dac_rate; }
+    uint32_t get_rrc_fixed_L() const { return rrc_fixed_L; }
     uint32_t get_rrc_L() const { return rrc_L; }
     bool get_use_rrc() const { return use_rrc; }
     bool is_running() const { return running; }
+
+    void set_rrc_fixed_L(uint32_t L) {
+        // L should be a multiple of 4 to keep DMA 32-bit aligned, or 0 for Auto
+        if (L > 0) {
+            L = (L + 3) & ~3;
+        }
+        rrc_fixed_L = L;
+        if (rrc_enabled) {
+            compute_rrc_lut();
+            
+            // Re-apply symbol rate to update PIO clock divisor based on new L
+            uint32_t old_rate = symbolrate_hz;
+            symbolrate_hz = 0; // force update
+            set_symbolrate(old_rate);
+        }
+    }
 
     void update_rrc_config(bool enabled, float alpha, uint8_t span, uint32_t min_dac_rate, bool use_rrc_filter) {
         lock_config();
@@ -653,6 +683,12 @@ public:
         __dmb();
         config_lock = false;
         __dmb();
+    }
+
+    void enable_dma_irq_core1() {
+        irq_set_exclusive_handler(DMA_IRQ_0, bpsk_dma_isr);
+        irq_set_priority(DMA_IRQ_0, 0); // 0 = Highest hardware priority
+        irq_set_enabled(DMA_IRQ_0, true);
     }
 
     __attribute__((always_inline)) inline uint16_t get_frame_size() const {
@@ -893,8 +929,8 @@ public:
 
         // VCDU header at bytes 4-9 with specified VCID
         build_vcdu_header(frame, VCDU_OFFSET, vcid, vcdu_vcid_counters[vcid]);
-        vcdu_vcid_counters[vcid]++; // Increment per-VCID counter
-        vcdu_frame_count++;         // Increment master frame counter
+        vcdu_vcid_counters[vcid & 0x3F]++; // Increment per-VCID counter
+        vcdu_frame_count++;                // Increment master frame counter
 
         uint16_t length_to_crc;
         if (ldpc_enabled) {
@@ -1172,7 +1208,7 @@ public:
         frame[3] = 0x1D;
 
         build_vcdu_header(frame, ASM_SIZE, vcid, vcdu_vcid_counters[vcid]);
-        vcdu_vcid_counters[vcid]++;
+        vcdu_vcid_counters[vcid & 0x3F]++;
         vcdu_frame_count++;
 
         build_mpdu_header(frame, ASM_SIZE + VCDU_HEADER_SIZE, fhp);
@@ -1547,26 +1583,29 @@ public:
         if (active_chunks >= DMA_RING_SIZE - 1)
             return false; // Queue full
 
-        DmaChunk *chunk = &dma_ring[h];
-
         if (!pop_pending_frame(current_tx_frame)) {
             return false; // Queue empty, wait for Core 1 to generate a dynamic frame.
         }
+
+        DmaChunk *chunk = &dma_ring[h];
 
         uint8_t vcid_byte = current_tx_frame[5];
         if (randomizer_enabled) {
             vcid_byte ^= get_randomizer_seq()[1]; // Revert the XOR for byte 5
         }
         bool chunk_is_user = ((vcid_byte & 0x3F) != 0x3F);
+        uint16_t frame_len = get_frame_size();
 
         if (rrc_enabled && rrc_lut != nullptr) {
-            uint32_t bytes_written = 0;
+            uint32_t bytes_written = rrc_chunk_bytes_written; // LOAD STATE
             uint8_t *dest = (uint8_t *)chunk->words;
             uint32_t max_bytes = MAX_DMA_WORDS * 4;
             uint32_t L = rrc_L;
             uint32_t mask = (1 << rrc_filter_span) - 1;
 
-            for (uint16_t i = 0; i < get_frame_size(); i++) {
+            uint32_t words_to_copy = L >> 2;
+
+            for (uint16_t i = 0; i < frame_len; i++) {
                 uint8_t b = current_tx_frame[i];
 
                 if (!convolution_enabled) {
@@ -1575,9 +1614,6 @@ public:
                         rrc_history = ((rrc_history << 1) | symbol) & mask;
 
                         if (bytes_written + L > max_bytes) {
-                            while (bytes_written % 4 != 0) {
-                                dest[bytes_written++] = 0x80;
-                            }
                             chunk->length = bytes_written / 4;
                             chunk->is_user_data = chunk_is_user;
                             __dmb();
@@ -1587,12 +1623,10 @@ public:
                             while (true) {
                                 uint16_t tail = dma_ring_tail;
                                 uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                                if (active < DMA_RING_SIZE - 1) {
+                                if (active < DMA_RING_SIZE - 1)
                                     break;
-                                }
-                                if (!running || config_lock) {
+                                if (!running || config_lock)
                                     return false;
-                                }
                                 delayMicroseconds(10);
                             }
                             chunk = &dma_ring[h];
@@ -1600,7 +1634,13 @@ public:
                             bytes_written = 0;
                         }
 
-                        memcpy(dest + bytes_written, rrc_lut + (rrc_history * L), L);
+                        uint32_t *dst_word = (uint32_t *)(dest + bytes_written);
+                        const uint32_t *src_word = (const uint32_t *)(rrc_lut + (rrc_history * L));
+                        uint32_t words_to_copy = L >> 2; // Divide by 4
+
+                        for (uint32_t w = 0; w < words_to_copy; w++) {
+                            dst_word[w] = src_word[w];
+                        }
                         bytes_written += L;
                     }
                 } else {
@@ -1613,9 +1653,6 @@ public:
                             rrc_history = ((rrc_history << 1) | symbol) & mask;
 
                             if (bytes_written + L > max_bytes) {
-                                while (bytes_written % 4 != 0) {
-                                    dest[bytes_written++] = 0x80;
-                                }
                                 chunk->length = bytes_written / 4;
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
@@ -1625,12 +1662,10 @@ public:
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
                                     uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                                    if (active < DMA_RING_SIZE - 1) {
+                                    if (active < DMA_RING_SIZE - 1)
                                         break;
-                                    }
-                                    if (!running || config_lock) {
+                                    if (!running || config_lock)
                                         return false;
-                                    }
                                     delayMicroseconds(10);
                                 }
                                 chunk = &dma_ring[h];
@@ -1638,7 +1673,12 @@ public:
                                 bytes_written = 0;
                             }
 
-                            memcpy(dest + bytes_written, rrc_lut + (rrc_history * L), L);
+                            uint32_t *dst_word = (uint32_t *)(dest + bytes_written);
+                            const uint32_t *src_word = (const uint32_t *)(rrc_lut + (rrc_history * L));
+
+                            for (uint32_t w = 0; w < words_to_copy; w++) {
+                                dst_word[w] = src_word[w];
+                            }
                             bytes_written += L;
                         }
                     } else { // Punctured rates
@@ -1651,9 +1691,6 @@ public:
                             rrc_history = ((rrc_history << 1) | symbol) & mask;
 
                             if (bytes_written + L > max_bytes) {
-                                while (bytes_written % 4 != 0) {
-                                    dest[bytes_written++] = 0x80;
-                                }
                                 chunk->length = bytes_written / 4;
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
@@ -1663,12 +1700,10 @@ public:
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
                                     uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                                    if (active < DMA_RING_SIZE - 1) {
+                                    if (active < DMA_RING_SIZE - 1)
                                         break;
-                                    }
-                                    if (!running || config_lock) {
+                                    if (!running || config_lock)
                                         return false;
-                                    }
                                     delayMicroseconds(10);
                                 }
                                 chunk = &dma_ring[h];
@@ -1676,7 +1711,12 @@ public:
                                 bytes_written = 0;
                             }
 
-                            memcpy(dest + bytes_written, rrc_lut + (rrc_history * L), L);
+                            uint32_t *dst_word = (uint32_t *)(dest + bytes_written);
+                            const uint32_t *src_word = (const uint32_t *)(rrc_lut + (rrc_history * L));
+
+                            for (uint32_t w = 0; w < words_to_copy; w++) {
+                                dst_word[w] = src_word[w];
+                            }
                             bytes_written += L;
                         }
 
@@ -1689,9 +1729,6 @@ public:
                             rrc_history = ((rrc_history << 1) | symbol) & mask;
 
                             if (bytes_written + L > max_bytes) {
-                                while (bytes_written % 4 != 0) {
-                                    dest[bytes_written++] = 0x80;
-                                }
                                 chunk->length = bytes_written / 4;
                                 chunk->is_user_data = chunk_is_user;
                                 __dmb();
@@ -1701,12 +1738,10 @@ public:
                                 while (true) {
                                     uint16_t tail = dma_ring_tail;
                                     uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                                    if (active < DMA_RING_SIZE - 1) {
+                                    if (active < DMA_RING_SIZE - 1)
                                         break;
-                                    }
-                                    if (!running || config_lock) {
+                                    if (!running || config_lock)
                                         return false;
-                                    }
                                     delayMicroseconds(10);
                                 }
                                 chunk = &dma_ring[h];
@@ -1714,30 +1749,31 @@ public:
                                 bytes_written = 0;
                             }
 
-                            memcpy(dest + bytes_written, rrc_lut + (rrc_history * L), L);
+                            uint32_t *dst_word = (uint32_t *)(dest + bytes_written);
+                            const uint32_t *src_word = (const uint32_t *)(rrc_lut + (rrc_history * L));
+                            uint32_t words_to_copy = L >> 2; // Divide by 4
+
+                            for (uint32_t w = 0; w < words_to_copy; w++) {
+                                dst_word[w] = src_word[w];
+                            }
                             bytes_written += L;
                         }
                     }
                 }
             }
 
-            while (bytes_written % 4 != 0) {
-                dest[bytes_written++] = 0x80;
-            }
-            chunk->length = bytes_written / 4;
-            chunk->is_user_data = chunk_is_user;
-            __dmb();
-            dma_ring_head = (h + 1) % DMA_RING_SIZE;
+            rrc_chunk_bytes_written = bytes_written; // SAVE STATE (Do NOT push partial chunk)
             return true;
         }
 
-        uint32_t words_written = 0;
+        // --- Non-RRC path ---
+        uint32_t words_written = tx_chunk_words_written; // LOAD STATE
 
         if (!convolution_enabled) {
             uint64_t accum_data = tx_accum_data;
             uint8_t accum_bits = tx_accum_bits;
 
-            for (uint16_t i = 0; i < get_frame_size(); i++) {
+            for (uint16_t i = 0; i < frame_len; i++) {
                 accum_data = (accum_data << 8) | current_tx_frame[i];
                 accum_bits += 8;
 
@@ -1757,12 +1793,10 @@ public:
                         while (true) {
                             uint16_t tail = dma_ring_tail;
                             uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                            if (active < DMA_RING_SIZE - 1) {
+                            if (active < DMA_RING_SIZE - 1)
                                 break;
-                            }
-                            if (!running || config_lock) {
+                            if (!running || config_lock)
                                 return false;
-                            }
                             delayMicroseconds(10);
                         }
                         chunk = &dma_ring[h];
@@ -1770,7 +1804,6 @@ public:
                     }
                 }
             }
-
             tx_accum_data = accum_data;
             tx_accum_bits = accum_bits;
         } else {
@@ -1784,8 +1817,7 @@ public:
                 uint16_t out_word = CCSDS_CONV_FAST_LUT.byte_out[b] ^ CCSDS_CONV_FAST_LUT.state_out[conv_shift_reg];
                 conv_shift_reg = CCSDS_CONV_FAST_LUT.next_state[b];
 
-                if (current_conv_rate == 0) // Rate 1/2
-                {
+                if (current_conv_rate == 0) { // Rate 1/2
                     accum_data = (accum_data << 16) | out_word;
                     accum_bits += 16;
                 } else {
@@ -1818,12 +1850,10 @@ public:
                         while (true) {
                             uint16_t tail = dma_ring_tail;
                             uint16_t active = (h >= tail) ? (h - tail) : (DMA_RING_SIZE - tail + h);
-                            if (active < DMA_RING_SIZE - 1) {
+                            if (active < DMA_RING_SIZE - 1)
                                 break;
-                            }
-                            if (!running || config_lock) {
+                            if (!running || config_lock)
                                 return false;
-                            }
                             delayMicroseconds(10);
                         }
                         chunk = &dma_ring[h];
@@ -1831,17 +1861,12 @@ public:
                     }
                 }
             }
-
             tx_accum_data = accum_data;
             tx_accum_bits = accum_bits;
             punc_phase = current_punc_phase;
         }
 
-        chunk->length = words_written;
-        chunk->is_user_data = chunk_is_user;
-
-        __dmb();
-        dma_ring_head = (h + 1) % DMA_RING_SIZE;
+        tx_chunk_words_written = words_written; // SAVE STATE (Do NOT push partial chunk)
         return true;
     }
 
@@ -1946,9 +1971,7 @@ public:
         dma_channel_set_irq0_enabled(dma_chan_0, true);
         dma_channel_set_irq0_enabled(dma_chan_1, true);
 
-        irq_set_exclusive_handler(DMA_IRQ_0, bpsk_dma_isr);
-        irq_set_priority(DMA_IRQ_0, 0); // 0 = Highest hardware priority, perfectly preempts USB CDC
-        irq_set_enabled(DMA_IRQ_0, true);
+        // irq handler configuration deferred to enable_dma_irq_core1() on Core 1
     }
 
     bool tx_fifo_empty() const { return pio_sm_is_tx_fifo_empty(pio, sm); }
