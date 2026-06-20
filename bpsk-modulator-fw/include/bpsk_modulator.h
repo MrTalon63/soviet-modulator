@@ -15,11 +15,10 @@
 #include <hardware/timer.h>
 
 #include "rs.h"
+#include "viterbi.h"
 #define MAX_FRAME_SIZE 2044
 #define MSG_BUFFER_SIZE 512
 #define SP_FIFO_SIZE 131072              // 128 KB (Supports Max 64KB Space Packets + USB Jitter buffer)
-static constexpr uint8_t CONV_G1 = 0x79; // 1111001b, 171 octal
-static constexpr uint8_t CONV_G2 = 0x5B; // 1011011b, 133 octal
 
 // CCSDS AOS Level 0 Transfer Frame (VCDU) constants - CCSDS 732.0-B-5
 static constexpr uint16_t ASM_SIZE = 4;                                    // 4-byte Attached Synchronization Marker (not RS encoded)
@@ -90,44 +89,6 @@ struct alignas(4) BPSKRandomizer17FastLut {
 
 static constexpr BPSKRandomizer17FastLut CCSDS_RANDOMIZER17_FAST_LUT;
 
-constexpr uint8_t bpsk_parity8(uint8_t value) {
-    value ^= value >> 4;
-    value ^= value >> 2;
-    value ^= value >> 1;
-    return value & 1;
-}
-
-struct BPSKConvFastLut {
-    uint16_t byte_out[256];
-    uint16_t state_out[64];
-    uint8_t next_state[256];
-
-    constexpr BPSKConvFastLut() : byte_out{}, state_out{}, next_state{} {
-        for (int b = 0; b < 256; b++) {
-            uint16_t out_word = 0;
-            uint8_t c = 0;
-            for (int bit = 7; bit >= 0; bit--) {
-                uint8_t input_bit = (b >> bit) & 0x01;
-                c = (uint8_t)(((c >> 1) | (input_bit << 6)) & 0x7F);
-                out_word = (out_word << 2) | ((bpsk_parity8(c & CONV_G1) << 1) | (bpsk_parity8(c & CONV_G2)));
-            }
-            byte_out[b] = out_word;
-            next_state[b] = c >> 1; // Top 6 bits perfectly capture the state for the next byte
-        }
-
-        for (int s = 0; s < 64; s++) {
-            uint16_t out_word = 0;
-            uint8_t c = s << 1;
-            for (int bit = 7; bit >= 0; bit--) {
-                c = (uint8_t)((c >> 1) & 0x7F);
-                out_word = (out_word << 2) | ((bpsk_parity8(c & CONV_G1) << 1) | bpsk_parity8(c & CONV_G2));
-            }
-            state_out[s] = out_word;
-        }
-    }
-};
-// Removed constexpr to force the table into RAM to prevent Flash XIP cache misses
-static BPSKConvFastLut CCSDS_CONV_FAST_LUT;
 
 // CCSDS OID (Operational Idle Data) Frame - 40-bit Galois LFSR per CCSDS 732.0-B-5 Appendix D
 // OID frames contain a VCDU header with VCID=0x3F followed immediately by the OID idle data pattern.
@@ -192,49 +153,6 @@ __attribute__((always_inline)) static inline uint16_t calculate_fecf(const uint8
     return crc;
 }
 
-static constexpr uint8_t PUNC_PERIOD[] = {1, 2, 3, 5, 7};
-static constexpr uint8_t PUNC_C1[] = {0b1, 0b01, 0b101, 0b10101, 0b1010001};
-static constexpr uint8_t PUNC_C2[] = {0b1, 0b11, 0b011, 0b01011, 0b0101111};
-
-struct alignas(4) BPSKPunctureFastLut {
-    // table[rate][phase][byte] = (next_phase << 16) | (count << 8) | bits
-    uint32_t table[5][7][256];
-
-    constexpr BPSKPunctureFastLut() : table{} {
-        for (int rate = 1; rate <= 4; rate++) {
-            uint8_t p_period = PUNC_PERIOD[rate];
-            uint8_t c1_mask = PUNC_C1[rate];
-            uint8_t c2_mask = PUNC_C2[rate];
-
-            for (int phase = 0; phase < p_period; phase++) {
-                for (int val = 0; val < 256; val++) {
-                    uint8_t accum = 0;
-                    uint8_t count = 0;
-                    uint8_t current_phase = phase;
-
-                    for (int s = 3; s >= 0; s--) {
-                        uint8_t c1 = (val >> (s * 2 + 1)) & 1;
-                        uint8_t c2 = (val >> (s * 2)) & 1;
-                        if ((c1_mask >> current_phase) & 1) {
-                            accum = (accum << 1) | c1;
-                            count++;
-                        }
-                        if ((c2_mask >> current_phase) & 1) {
-                            accum = (accum << 1) | c2;
-                            count++;
-                        }
-
-                        current_phase++;
-                        if (current_phase >= p_period)
-                            current_phase = 0;
-                    }
-                    table[rate][phase][val] = accum | (count << 8) | (current_phase << 16);
-                }
-            }
-        }
-    }
-};
-static BPSKPunctureFastLut CCSDS_PUNC_FAST_LUT;
 
 static const uint16_t bpsk_modulator_program[] = {
     0x6008, // 0: out pins, 8  side 0
