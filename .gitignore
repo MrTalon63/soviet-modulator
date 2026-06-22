@@ -4,3 +4,11 @@
 *.ts
 
 *.bin
+
+bpsk_rrc/bpsk_rrc.gprj.user
+
+bpsk_rrc/build.tcl
+
+*.log
+
+bpsk_rrc/impl

@@ -1,0 +1,46 @@
+//Copyright (C)2014-2025 Gowin Semiconductor Corporation.
+//All rights reserved. 
+//File Title: Physical Constraints file
+//Tool Version: V1.9.11.03 Education
+//Part Number: GW1NR-LV9QN88PC6/I5
+//Device: GW1NR-9
+//Device Version: C
+//Created Time: Sun 06 21 04:59:54 2026
+
+IO_LOC "activity_led" 16;
+IO_PORT "activity_led" IO_TYPE=LVCMOS18 PULL_MODE=UP DRIVE=8 BANK_VCCIO=1.8;
+IO_LOC "physical_ad9708_clk" 28;
+IO_PORT "physical_ad9708_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[7]" 42;
+IO_PORT "physical_ad9708_data[7]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[6]" 41;
+IO_PORT "physical_ad9708_data[6]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[5]" 35;
+IO_PORT "physical_ad9708_data[5]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[4]" 40;
+IO_PORT "physical_ad9708_data[4]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[3]" 34;
+IO_PORT "physical_ad9708_data[3]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[2]" 33;
+IO_PORT "physical_ad9708_data[2]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[1]" 30;
+IO_PORT "physical_ad9708_data[1]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "physical_ad9708_data[0]" 29;
+IO_PORT "physical_ad9708_data[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "spi_miso" 36;
+IO_PORT "spi_miso" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8 BANK_VCCIO=3.3;
+IO_LOC "mcu_serial_data" 25;
+IO_PORT "mcu_serial_data" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+IO_LOC "mcu_bit_clk" 26;
+IO_PORT "mcu_bit_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+IO_LOC "spi_mosi" 37;
+IO_PORT "spi_mosi" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+IO_LOC "spi_sck" 38;
+IO_PORT "spi_sck" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+IO_LOC "spi_cs_n" 39;
+IO_PORT "spi_cs_n" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+IO_LOC "hardware_reset_n" 3;
+IO_PORT "hardware_reset_n" IO_TYPE=LVCMOS18 PULL_MODE=UP BANK_VCCIO=1.8;
+IO_LOC "xtal_27mhz_pin" 52;
+IO_PORT "xtal_27mhz_pin" IO_TYPE=LVCMOS33 PULL_MODE=UP BANK_VCCIO=3.3;
+CLOCK_LOC "xtal_27mhz_pin_d" BUFG = CLK;
